@@ -1,0 +1,5 @@
+name: antigravity-acp-provider
+kind: model-provider
+version: 1.0.0
+description: Google Antigravity via ACP subprocess (agy_acp_server.par)
+author: GleisonEm
