@@ -1,4 +1,4 @@
-From b6eb84f562fd88783c661922491b88cd6f3ec244 Mon Sep 17 00:00:00 2001
+From 3180323b01fcf30c096eff1588821aab64b25e7b Mon Sep 17 00:00:00 2001
 From: Gleison Emanuel <gleison.spfc1208@hotmail.com>
 Date: Tue, 1 Sep 2026 04:22:03 -0300
 Subject: [PATCH] antigravity-acp provider (local patchset)
@@ -13,6 +13,7 @@ Subject: [PATCH] antigravity-acp provider (local patchset)
  apps/desktop/src/app/settings/constants.ts   |   9 +-
  apps/desktop/src/components/model-picker.tsx |  60 ++-
  hermes_cli/auth.py                           | 101 +++-
+ hermes_cli/inventory.py                      |  32 ++
  hermes_cli/main.py                           |   3 +
  hermes_cli/model_setup_flows.py              | 115 ++++-
  hermes_cli/model_switch.py                   |  27 +-
@@ -23,7 +24,7 @@ Subject: [PATCH] antigravity-acp provider (local patchset)
  hermes_cli/web_server.py                     |  59 ++-
  tools/delegate_tool.py                       |   9 +-
  web/src/components/ModelPickerDialog.tsx     |  71 +++
- 19 files changed, 988 insertions(+), 46 deletions(-)
+ 20 files changed, 1020 insertions(+), 46 deletions(-)
 
 diff --git a/agent/agent_init.py b/agent/agent_init.py
 index b4e2e9ae5..4b435a66a 100644
@@ -1028,6 +1029,56 @@ index 6f823fa63..83c386ac6 100644
          "base_url": base_url.rstrip("/"),
          "command": resolved_command or command,
          "args": args,
+diff --git a/hermes_cli/inventory.py b/hermes_cli/inventory.py
+index 320bbc031..99454b827 100644
+--- a/hermes_cli/inventory.py
++++ b/hermes_cli/inventory.py
+@@ -798,6 +798,25 @@ def _filter_explicit_provider_rows(rows: list[dict], ctx: ConfigContext) -> list
+             # just accepted those same credentials when building it.
+             kept.append(row)
+             continue
++        if _provider_is_external_process(slug):
++            # ACP subprocess providers (antigravity-acp, copilot-acp) are
++            # "explicitly configured" when their local kernel/CLI binary
++            # resolves — the user deliberately installed/authenticated it
++            # (e.g. Zed Antigravity extension + oauth-personal state), and
++            # is_provider_explicitly_configured() knows nothing about the
++            # external_process auth type, so the strict gate below silently
++            # hides the provider from the desktop picker even though
++            # list_authenticated_providers emitted it. Mirror the signal
++            # that section accepted.
++            try:
++                from hermes_cli.auth import get_external_process_provider_status
++                if bool(
++                    (get_external_process_provider_status(slug) or {}).get("configured")
++                ):
++                    kept.append(row)
++                    continue
++            except Exception:
++                pass
+         if is_provider_explicitly_configured(slug):
+             kept.append(row)
+     return kept
+@@ -813,6 +832,19 @@ def _provider_is_keyless(slug: str) -> bool:
+         return False
+ 
+ 
++def _provider_is_external_process(slug: str) -> bool:
++    """True when the provider runs as a local ACP subprocess (antigravity-acp,
++    copilot-acp): auth is the resolved kernel/CLI binary, not an API key."""
++    try:
++        from hermes_cli.providers import HERMES_OVERLAYS
++        overlay = HERMES_OVERLAYS.get(slug)
++        return bool(
++            overlay is not None and getattr(overlay, "auth_type", "") == "external_process"
++        )
++    except Exception:
++        return False
++
++
+ def _raw_config_has_enabled_moa_preset() -> bool:
+     """Return True when the user's raw config explicitly enables MoA.
+ 
 diff --git a/hermes_cli/main.py b/hermes_cli/main.py
 index 8a43b2374..a35a45464 100644
 --- a/hermes_cli/main.py
