@@ -1,33 +1,346 @@
-From 3180323b01fcf30c096eff1588821aab64b25e7b Mon Sep 17 00:00:00 2001
-From: Gleison Emanuel <gleison.spfc1208@hotmail.com>
-Date: Tue, 1 Sep 2026 04:22:03 -0300
-Subject: [PATCH] antigravity-acp provider (local patchset)
-
----
- agent/agent_init.py                          |   4 +-
- agent/agent_runtime_helpers.py               |  23 +-
- agent/auxiliary_client.py                    |  10 +-
- agent/chat_completion_helpers.py             |  13 +-
- agent/conversation_loop.py                   |   2 +-
- agent/copilot_acp_client.py                  | 480 ++++++++++++++++++-
- apps/desktop/src/app/settings/constants.ts   |   9 +-
- apps/desktop/src/components/model-picker.tsx |  60 ++-
- hermes_cli/auth.py                           | 101 +++-
- hermes_cli/inventory.py                      |  32 ++
- hermes_cli/main.py                           |   3 +
- hermes_cli/model_setup_flows.py              | 115 ++++-
- hermes_cli/model_switch.py                   |  27 +-
- hermes_cli/models.py                         |  19 +
- hermes_cli/providers.py                      |   6 +
- hermes_cli/runtime_provider.py               |   9 +-
- hermes_cli/setup.py                          |  14 +
- hermes_cli/web_server.py                     |  59 ++-
- tools/delegate_tool.py                       |   9 +-
- web/src/components/ModelPickerDialog.tsx     |  71 +++
- 20 files changed, 1020 insertions(+), 46 deletions(-)
-
+diff --git a/agent/acp_context_pack.py b/agent/acp_context_pack.py
+new file mode 100644
+index 0000000000..9f9fca05c0
+--- /dev/null
++++ b/agent/acp_context_pack.py
+@@ -0,0 +1,334 @@
++"""ACP context pack — dá ao kernel Antigravity o contexto que o Hermes tem.
++
++O kernel ACP só recebe o transcript da conversa; ele não conhece a memória
++do usuário (MEMORY.md/USER.md), nem as skills curadas de domínio (SimPay,
++Uniplus, k8s, ...). Provedores nativos resolvem isso com system prompt
++estruturado + memória prefetch + índice de skills com skill_view sob
++demanda; o kernel não tem nenhum desses mecanismos (só recebe texto), então
++este módulo replica o essencial:
++
++  1. Memória do perfil: MEMORY.md + USER.md (arquivos pequenos — cabem
++     inteiros no prompt sem custo relevante).
++  2. Skills top-N por relevância: score das palavras-chave da query contra
++     name + description + category, corpo truncado (mesmo limite de 4000
++     chars que o scan do Hermes usa).
++
++Controle: `model.acp_context_pack` (config.yaml) ou env
++`HERMES_ANTIGRAVITY_ACP_CONTEXT_PACK`:
++  - "off" / "0" / "false"  → desligado (default)
++  - "auto" / "1" / "true"  → N=5 skills + memória
++  - número ("3", "10")     → N skills + memória
++
++Nunca levanta exceção fora do módulo: falha de pack NÃO pode quebrar um
++request (o kernel não pode depender da saúde da memória/skills do Hermes).
++"""
++from __future__ import annotations
++
++import logging
++import os
++import re
++import time
++from pathlib import Path
++from typing import Any, Dict, List, Optional
++
++logger = logging.getLogger(__name__)
++
++_DEFAULT_MAX_SKILLS = 5
++_SKILL_BODY_LIMIT = 4000  # mesmo limite do scan do Hermes (tools/skills_tool.py)
++# Cache curto por (profile, query-hash) — o pack é recomputado no máximo
++# 1x por 60s por query, no processo em que o cliente roda.
++_CACHE_TTL_SECONDS = 60.0
++_cache: Dict[str, tuple[float, str]] = {}
++
++
++def is_context_pack_enabled() -> bool:
++    """Lê model.acp_context_pack (ou env). ''/None → off (opt-in)."""
++    env = os.getenv("HERMES_ANTIGRAVITY_ACP_CONTEXT_PACK", "").strip().lower()
++    if env:
++        return env not in {"0", "off", "false", "no"}
++    try:
++        from hermes_cli.config import load_config_readonly
++
++        cfg = load_config_readonly()
++        m = cfg.get("model") or {}
++        v = m.get("acp_context_pack")
++        if v is None:
++            return False
++        if isinstance(v, bool):
++            return v
++        s = str(v).strip().lower()
++        return s not in {"", "0", "off", "false", "no"}
++    except Exception:
++        return False
++
++
++def max_skills() -> int:
++    """N de skills a injetar (auto → _DEFAULT_MAX_SKILLS; número → N)."""
++    env = os.getenv("HERMES_ANTIGRAVITY_ACP_CONTEXT_PACK", "").strip().lower()
++    raw = env
++    if not raw:
++        try:
++            from hermes_cli.config import load_config_readonly
++
++            cfg = load_config_readonly()
++            m = cfg.get("model") or {}
++            raw = str(m.get("acp_context_pack", "")).strip().lower()
++        except Exception:
++            raw = ""
++    if raw.isdigit():
++        return max(0, min(int(raw), 20))
++    return _DEFAULT_MAX_SKILLS
++
++
++def _profile_identity() -> str:
++    """Identidade do profile ativo para cache — HERMES_PROFILE ou HERMES_HOME."""
++    return (
++        os.getenv("HERMES_PROFILE", "")
++        or os.getenv("HERMES_HOME", "")
++        or os.path.expanduser("~/.hermes")
++    )
++
++
++def _memories_dir() -> Optional[Path]:
++    """Resolve o diretório de memórias do profile ativo (cascata)."""
++    profile = os.getenv("HERMES_PROFILE", "").strip()
++    home = os.getenv("HERMES_HOME", "").strip()
++    candidates = []
++    base = Path(os.path.expanduser("~/.hermes"))
++    if profile:
++        candidates.append(base / "profiles" / profile / "memories")
++    if home:
++        candidates.append(Path(home) / "memories")
++    candidates.append(base / "memories")
++    for c in candidates:
++        if c.is_dir():
++            return c
++    return None
++
++
++def _read_memory_file(d: Path, name: str) -> str:
++    p = d / name
++    try:
++        if p.is_file():
++            return p.read_text(encoding="utf-8", errors="replace").strip()
++    except Exception as e:
++        logger.debug("acp context: ler %s falhou: %s", name, e)
++    return ""
++
++
++def _query_from_messages(messages: List[Dict[str, Any]]) -> str:
++    """Última mensagem de role=user (a task atual)."""
++    for message in reversed(messages or []):
++        if not isinstance(message, dict):
++            continue
++        if str(message.get("role", "")).strip().lower() != "user":
++            continue
++        content = message.get("content")
++        if isinstance(content, str) and content.strip():
++            return content.strip()[:1000]
++        if isinstance(content, list):
++            parts = []
++            for block in content:
++                if isinstance(block, dict) and isinstance(block.get("text"), str):
++                    parts.append(block["text"])
++            if parts:
++                return " ".join(parts)[:1000]
++    return ""
++
++
++def _tokenize(text: str) -> set[str]:
++    return {w for w in re.findall(r"[a-z0-9]{3,}", text.lower()) if w not in _STOP}
++
++
++_STOP = {
++    "que", "para", "com", "uma", "pode", "isso", "essa", "este", "aqui",
++    "como", "mais", "mas", "por", "dos", "das", "the", "and", "for", "with",
++    "from", "this", "that", "you", "your", "have", "not", "are", "was",
++}
++
++# Budget máximo da perna externa (espelha _EXTERNAL_PREFETCH_TIMEOUT_S=8s
++# do MemoryManager, com folga para o import do plugin). O pack nunca pode
++# segurar o request ACP por causa de um backend de memória lento.
++_EXTERNAL_PREFETCH_BUDGET_S = 12.0
++_EXTERNAL_PREFETCH_CAP = 4000
++
++
++def _score_skill(query_tokens: set[str], skill: Dict[str, Any]) -> int:
++    haystack = " ".join(
++        str(skill.get(k, "")) for k in ("name", "description", "category")
++    ).lower()
++    words = set(re.findall(r"[a-z0-9]{3,}", haystack))
++    return len(query_tokens & words)
++
++
++def _find_skills() -> List[Dict[str, Any]]:
++    """Skills do profile vivo via scanner oficial do Hermes (filtrado por
++    plataforma e disabled), com fallback vazio em erro — nunca quebra o pack."""
++    try:
++        from tools.skills_tool import _find_all_skills
++
++        return _find_all_skills(skip_disabled=False)
++    except Exception as e:
++        logger.debug("acp context: scan de skills falhou: %s", e)
++        return []
++
++
++def _skill_body(skill: Dict[str, Any]) -> str:
++    """Corpo da skill (SKILL.md, truncado) — fallback vazio em erro."""
++    try:
++        from tools.skill_manager_tool import _find_skill
++
++        found = _find_skill(str(skill.get("name", "")))
++        if not found:
++            return ""
++        p = Path(found["path"]) / "SKILL.md"
++        if not p.is_file():
++            return ""
++        content = p.read_text(encoding="utf-8-sig", errors="replace")
++        # Corta frontmatter (--- ... ---) para o corpo começar no uso real.
++        if content.startswith("---"):
++            end = content.find("\n---", 3)
++            if end != -1:
++                content = content[end + 4 :]
++        return content.strip()[:_SKILL_BODY_LIMIT]
++    except Exception as e:
++        logger.debug("acp context: corpo da skill %s falhou: %s", skill.get("name"), e)
++        return ""
++
++
++def _external_prefetch(query: str) -> str:
++    """Prefetch do provider externo de memória (a mesma perna do nativo).
++
++    Espelha agent/turn_context.py: lê memory.provider do config, carrega
++    via plugins.memory.load_memory_provider, pula prompts triviais
++    (is_trivial_prompt) e chama prefetch(query) com budget limitado.
++    Retorna "" quando não há provider configurado (caso do profile
++    simpay hoje — só builtin, que já vai inteiro na seção MEMORY/USER),
++    em erro, ou em timeout. Nunca levanta.
++    """
++    if not query or not query.strip():
++        return ""
++    try:
++        from agent.memory_provider import is_trivial_prompt
++
++        if is_trivial_prompt(query):
++            return ""
++    except Exception:
++        pass
++    try:
++        from hermes_cli.config import load_config_readonly
++
++        cfg = load_config_readonly()
++        mem_cfg = (cfg.get("memory") or {}) if isinstance(cfg, dict) else {}
++        provider_name = str(mem_cfg.get("provider", "") or "").strip()
++    except Exception as e:
++        logger.debug("acp context: ler memory.provider falhou: %s", e)
++        return ""
++    if not provider_name:
++        return ""
++    box: Dict[str, str] = {}
++
++    def _run() -> None:
++        try:
++            from plugins.memory import load_memory_provider
++
++            mp = load_memory_provider(provider_name)
++            if mp is None or not mp.is_available():
++                return
++            try:
++                mp.on_turn_start(0, query)
++            except Exception:
++                pass
++            box["value"] = mp.prefetch(query) or ""
++        except Exception as e:
++            logger.debug("acp context: prefetch externo falhou: %s", e)
++
++    import threading
++
++    t = threading.Thread(target=_run, daemon=True, name=f"acp-context-prefetch-{provider_name}")
++    t.start()
++    t.join(_EXTERNAL_PREFETCH_BUDGET_S)
++    if t.is_alive():
++        logger.warning(
++            "acp context: prefetch externo '%s' excedeu %.0fs (ignorado)",
++            provider_name, _EXTERNAL_PREFETCH_BUDGET_S,
++        )
++        return ""
++    return box.get("value", "").strip()[:_EXTERNAL_PREFETCH_CAP]
++
++
++def build_context_pack(messages: List[Dict[str, Any]]) -> str:
++    """Monta o bloco "Hermes context (memória + skills)" para o prompt ACP.
++
++    Retorna string vazia se desligado ou sem nada útil. Nunca levanta.
++    """
++    try:
++        if not is_context_pack_enabled():
++            return ""
++
++        query = _query_from_messages(messages)
++        profile = _profile_identity()
++        cache_key = f"{profile}\u0000{query}\u0000{max_skills()}"
++        now = time.monotonic()
++        cached = _cache.get(cache_key)
++        if cached and (now - cached[0]) < _CACHE_TTL_SECONDS:
++            return cached[1]
++
++        sections: List[str] = []
++
++        # 1) Memória do perfil (arquivos pequenos — inteiros)
++        mem_dir = _memories_dir()
++        if mem_dir:
++            memory = _read_memory_file(mem_dir, "MEMORY.md")
++            user = _read_memory_file(mem_dir, "USER.md")
++            if memory:
++                sections.append("MEMORY (notas persistentes do Hermes):\n" + memory[:6000])
++            if user:
++                sections.append("USER (perfil do usuário):\n" + user[:4000])
++
++        # 1b) Provider externo de memória (mesma perna do nativo). No
++        # profile simpay hoje retorna "" (só builtin) — sem custo.
++        try:
++            ext = _external_prefetch(query)
++        except Exception:
++            ext = ""
++        if ext:
++            sections.append("MEMORY PROVIDER (prefetch relevante à task):\n" + ext)
++
++        # 2) Skills top-N por relevância
++        n = max_skills()
++        if n > 0:
++            skills = _find_skills()
++            query_tokens = _tokenize(query) if query else set()
++            scored = [( _score_skill(query_tokens, s), s) for s in skills]
++            scored.sort(key=lambda pair: (pair[0], str(pair[1].get("name", ""))), reverse=True)
++            picked = [s for score, s in scored if score > 0][:n]
++            # Query vazia ou sem match: sem skills (evita ruído aleatório).
++            if picked:
++                parts = []
++                for s in picked:
++                    body = _skill_body(s)
++                    if body:
++                        parts.append(f"### {s.get('name')} ({s.get('category','')})\n{body}")
++                if parts:
++                    sections.append(
++                        "SKILLS HERMES (conhecimento de domínio — siga o procedimento "
++                        "quando a task casar com o tema):\n" + "\n\n".join(parts)
++                    )
++
++        if not sections:
++            _cache[cache_key] = (now, "")
++            return ""
++
++        pack = (
++            "HERMES CONTEXT (contexto persistente que o kernel normalmente não vê — "
++            "memória do usuário + skills de domínio). Use quando relevante para a task:\n\n"
++            + "\n\n".join(sections)
++        )
++        _cache[cache_key] = (now, pack)
++        # Só log com o tamanho — o conteúdo não (privacidade + ruído).
++        logger.info("Antigravity ACP context pack: %d chars, %d seções", len(pack), len(sections))
++        return pack
++    except Exception as e:  # nunca quebra o request
++        logger.warning("Antigravity ACP context pack falhou (ignorado): %s", e)
++        return ""
+\ No newline at end of file
 diff --git a/agent/agent_init.py b/agent/agent_init.py
-index b4e2e9ae5..4b435a66a 100644
+index b4e2e9ae5d..4b435a66ad 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
 @@ -831,7 +831,7 @@ def init_agent(
@@ -49,7 +362,7 @@ index b4e2e9ae5..4b435a66a 100644
                  client_kwargs["args"] = agent.acp_args
              effective_base = base_url
 diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
-index f9be7a047..6cdea5a95 100644
+index f9be7a0476..6cdea5a951 100644
 --- a/agent/agent_runtime_helpers.py
 +++ b/agent/agent_runtime_helpers.py
 @@ -2737,7 +2737,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
@@ -90,10 +403,34 @@ index f9be7a047..6cdea5a95 100644
              # X-Title) that were lost when _client_kwargs was rebuilt from
              # scratch.  Without this, model switches clear attribution headers
 diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
-index 47c682fde..9cbfba1d9 100644
+index 47c682fde6..ff95f62bdb 100644
 --- a/agent/auxiliary_client.py
 +++ b/agent/auxiliary_client.py
-@@ -7479,21 +7479,21 @@ def resolve_provider_client(
+@@ -6490,6 +6490,23 @@ def _resolve_auto_route(
+             runtime_api_key = ""
+             runtime_api_mode = ""
+ 
++    # ACP subprocess providers (copilot-acp / antigravity-acp): single-lane
++    # kernels serialized per cwd (sess.lock in copilot_acp_client). Routing
++    # auxiliary tasks through the same kernel queues the ~8-token title call
++    # behind the in-flight main turn — and a stalled kernel hangs aux with
++    # it (stall 21:24 03/09/2026). Skip Step-1 so aux falls through to the
++    # HTTP fallback chain (Step 2/3). Explicit per-task overrides
++    # (auxiliary.<task>.provider) are resolved before this auto chain and
++    # still win. Mirrors the MoA skip above.
++    if (main_provider in {"copilot-acp", "antigravity-acp"}
++            or runtime_base_url.strip().lower().startswith(("acp://", "acp+tcp://"))):
++        logger.info(
++            "Auxiliary auto-detect: main provider is ACP (%s) — skipping "
++            "Step-1, aux tasks use the HTTP fallback chain",
++            main_provider or runtime_base_url,
++        )
++        main_provider = ""
++
+     if (main_provider and main_model
+             and main_provider not in {"auto", ""}):
+         resolved_provider = main_provider
+@@ -7479,21 +7496,21 @@ def resolve_provider_client(
              or _read_main_model_for_aux(),
              provider,
          )
@@ -121,10 +458,99 @@ index 47c682fde..9cbfba1d9 100644
                  return None, None
              from agent.copilot_acp_client import CopilotACPClient
 diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
-index 501284461..a8ec0efb6 100644
+index 501284461f..b29bdafb99 100644
 --- a/agent/chat_completion_helpers.py
 +++ b/agent/chat_completion_helpers.py
-@@ -2925,8 +2925,19 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
+@@ -1706,6 +1706,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
+     _call_start = time.time()
+     agent._touch_activity("waiting for non-streaming API response")
+ 
++    # ACP progress feed state: last notice text + emit time, so a tool-call
++    # change re-renders the status promptly (throttled) instead of only on the
++    # 30s heartbeat.
++    _acp_notice_state = {"desc": "", "ts": time.monotonic()}
++
+     t = threading.Thread(target=_context_thread_target(_call), daemon=True)
+     t.start()
+     _poll_count = 0
+@@ -1713,11 +1718,55 @@ def interruptible_api_call(agent, api_kwargs: dict):
+         t.join(timeout=0.3)
+         _poll_count += 1
+ 
+-        # Every ~30s: touch activity for the gateway inactivity monitor AND
+-        # rewrite the live spinner/status line so CLI/TUI/Desktop users see
+-        # what the agent is waiting on instead of an unexplained generic
+-        # spinner (the "infinite thinking" complaint — the wait itself is
+-        # usually a slow/overloaded provider, but the UI never said so).
++        # ── ACP progress feed (antigravity-acp / copilot-acp kernels) ─────
++        # Checked every poll (0.3s); emits only when something changed
++        # (tool-call desc, throttled to ~5s) or on the 30s heartbeat. The
++        # worker thread registered a holder whose "ref" points at the live
++        # kernel telemetry dict (None during boot → generic notice below).
++        _acp_progress = None
++        try:
++            from agent.copilot_acp_client import get_acp_thread_progress
++
++            _acp_holder = get_acp_thread_progress(t.ident)
++            if _acp_holder:
++                _acp_progress = _acp_holder.get("ref")
++        except Exception:
++            _acp_progress = None
++        if _acp_progress:
++            _now_mono = time.monotonic()
++            _last_event = _acp_progress.get("last_event_ts")
++            _desc = str(_acp_progress.get("last_desc") or "").strip()
++            _since_emit = _now_mono - _acp_notice_state["ts"]
++            if _last_event is not None and (_now_mono - _last_event) < 30:
++                # Kernel visibly working → live status. Re-emit when the
++                # activity description changes (throttle) or every 30s
++                # (heartbeat), so a long turn keeps the UI honest.
++                _notice_desc = _desc or "trabalhando"
++                _desc_changed = _notice_desc != _acp_notice_state["desc"]
++                if (_desc_changed and _since_emit >= 5.0) or _since_emit >= 30.0:
++                    agent._emit_wait_notice(f"⏳ kernel: {_notice_desc}…")
++                    agent._touch_activity(f"acp kernel ativo: {_notice_desc}")
++                    _acp_notice_state["desc"] = _notice_desc
++                    _acp_notice_state["ts"] = _now_mono
++            else:
++                # No kernel activity → a REAL stall notice (with last known
++                # activity), heartbeat at 30s — not the generic noise.
++                _silent = 0 if _last_event is None else int(_now_mono - _last_event)
++                if _since_emit >= 30.0:
++                    agent._emit_wait_notice(
++                        f"⏳ kernel sem atividade há {_silent}s — última: "
++                        f"{_desc or '—'}. O Google pode estar lento; "
++                        f"continue aguardando ou envie stop para cancelar."
++                    )
++                    _acp_notice_state["ts"] = _now_mono
++            continue
++
++        # Every ~30s (non-ACP providers): touch activity for the gateway
++        # inactivity monitor AND rewrite the live spinner/status line so
++        # CLI/TUI/Desktop users see what the agent is waiting on instead of
++        # an unexplained generic spinner (the "infinite thinking" complaint —
++        # the wait itself is usually a slow/overloaded provider, but the UI
++        # never said so).
+         if _poll_count % 100 == 0:  # 100 × 0.3s = 30s
+             _elapsed = time.time() - _call_start
+             try:
+@@ -1914,6 +1963,15 @@ def interruptible_api_call(agent, api_kwargs: dict):
+                 _close_request_client_once("interrupt_abort")
+             except Exception:
+                 pass
++            # ACP keep-alive kernels are subprocesses, not HTTP — the socket
++            # close above does not reach them. Signal their wait loops so an
++            # in-flight ACP turn aborts within ~0.1s and evicts (otherwise the
++            # abandoned thread holds the kernel lock until the deadline).
++            try:
++                from agent.copilot_acp_client import cancel_acp_keep_alive_sessions
++                cancel_acp_keep_alive_sessions("interrupt_abort")
++            except Exception:
++                pass
+             _retire_codex_request_token()
+             # #81521 (sibling of the streaming-path fix): wait for the worker
+             # to unwind Relay-managed scopes before surfacing
+@@ -2925,8 +2983,19 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
              agent._client_kwargs = {
                  "api_key": fb_client.api_key,
                  "base_url": fb_base_url,
@@ -145,8 +571,23 @@ index 501284461..a8ec0efb6 100644
              if _fb_timeout is not None:
                  agent._client_kwargs["timeout"] = _fb_timeout
                  # Rebuild the shared OpenAI client so the configured
+@@ -5627,6 +5696,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                     # client's socket from this poll thread; the shared
+                     # _anthropic_client is never closed here.
+                     _close_request_client_once("stream_interrupt_abort")
++                    # ACP keep-alive kernels are subprocesses (no HTTP socket
++                    # to abort) — signal their wait loops directly (see the
++                    # non-streaming interrupt_abort site above).
++                    try:
++                        from agent.copilot_acp_client import cancel_acp_keep_alive_sessions
++                        cancel_acp_keep_alive_sessions("stream_interrupt_abort")
++                    except Exception:
++                        pass
+                 except Exception:
+                     pass
+                 # Wait for the worker to unwind Relay-managed stream scopes
 diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
-index 9d2bff738..63a2875d6 100644
+index 9d2bff7385..63a2875d61 100644
 --- a/agent/conversation_loop.py
 +++ b/agent/conversation_loop.py
 @@ -3538,7 +3538,7 @@ def run_conversation(
@@ -159,7 +600,7 @@ index 9d2bff738..63a2875d6 100644
                      or str(agent.base_url or "").lower().startswith("acp+tcp://")
                  ):
 diff --git a/agent/copilot_acp_client.py b/agent/copilot_acp_client.py
-index a547895b2..25cc95200 100644
+index a547895b26..965d875f56 100644
 --- a/agent/copilot_acp_client.py
 +++ b/agent/copilot_acp_client.py
 @@ -9,6 +9,7 @@ back into the minimal shape Hermes expects from an OpenAI client.
@@ -179,7 +620,7 @@ index a547895b2..25cc95200 100644
  from agent.redact import redact_sensitive_text
  from tools.environments.local import hermes_subprocess_env
  
-@@ -162,6 +165,99 @@ def _build_subprocess_env() -> dict[str, str]:
+@@ -162,6 +165,461 @@ def _build_subprocess_env() -> dict[str, str]:
      return env
  
  
@@ -229,15 +670,370 @@ index a547895b2..25cc95200 100644
 +    return False
 +
 +
++def _is_progress_feed_enabled() -> bool:
++    """Whether to parse the kernel stderr telemetry stream (progress feed).
++
++    The Antigravity kernel logs its internal WebSocket activity to stderr
++    (``RAW WS MSG: {json}`` lines): tool calls, step/usage updates and policy
++    gates — the same feed the `agy` CLI TUI renders. We use it for live
++    wait-notice text, real token accounting (kills the ``in=0 out=0`` lie)
++    and stall diagnostics. Pure addition: an unparseable/changed log format
++    degrades gracefully to the old behavior (no progress shown, tokens 0).
++
++    Default ON; disable with HERMES_ANTIGRAVITY_ACP_PROGRESS_FEED=0 or
++    config.yaml model.acp_progress_feed: false.
++    """
++    env = os.getenv("HERMES_ANTIGRAVITY_ACP_PROGRESS_FEED", "").strip().lower()
++    if env:
++        return env in {"1", "true", "yes", "on"}
++    try:
++        from hermes_cli.config import load_config_readonly
++
++        cfg = load_config_readonly()
++        m = cfg.get("model") or {}
++        if isinstance(m, dict):
++            v = m.get("acp_progress_feed")
++            if isinstance(v, bool):
++                return v
++            if isinstance(v, str):
++                return v.strip().lower() in {"1", "true", "yes", "on"}
++            if isinstance(v, int):
++                return bool(v)
++    except Exception:
++        pass
++    return True
++
++
 +# Persistent ACP sessions — one kernel process + sessionId lives across
 +# multiple Hermes turns (like Zed). Keyed by (command, args, cwd) so
 +# concurrent Hermes sessions with different cwds don't share a kernel.
 +_KEEP_ALIVE_REGISTRY: dict[str, Any] = {}
 +_KEEP_ALIVE_REGISTRY_LOCK = threading.Lock()
 +
++# Boot budget for a fresh kernel (initialize + session/new + set_config).
++# Deliberately much shorter than the prompt deadline: a Google-side stall
++# during boot must fail fast with diagnostics, not wedge the session for
++# the full prompt timeout (stall 21:24 03/09/2026 — session badea4).
++_BOOT_TIMEOUT_SECONDS = 60.0
++
++# Double-checked boot coordination: key -> event signalled when the in-flight
++# boot finishes (success or failure). Lets concurrent turns wait on the boot
++# WITHOUT holding _KEEP_ALIVE_REGISTRY_LOCK across the multi-second spawn.
++_KEEP_ALIVE_BOOT_EVENTS: dict[str, threading.Event] = {}
++
++# Sessions currently inside _create_persistent_session (bootstrapping, not yet
++# in the registry). Registered so cancel_acp_keep_alive_sessions() can abort
++# a boot in flight instead of leaving it to run to the deadline.
++_KEEP_ALIVE_BOOTING: dict[str, Any] = {}
++
++
++def _boot_timeout_seconds(requested: float | None) -> float:
++    """Cap the kernel-boot budget at _BOOT_TIMEOUT_SECONDS.
++
++    The prompt deadline (often 180-900s) is fine for generation, but boot
++    (initialize + session/new) answers in seconds when Google is healthy —
++    past 60s it is a stall, and the caller deserves a fast, diagnosable
++    error instead of a hung session.
++    """
++    try:
++        v = float(requested or 0)
++    except (TypeError, ValueError):
++        v = 0
++    if v <= 0:
++        return _BOOT_TIMEOUT_SECONDS
++    return min(v, _BOOT_TIMEOUT_SECONDS)
++
++
++def cancel_acp_keep_alive_sessions(reason: str = "interrupt") -> int:
++    """Signal every live/booting keep-alive session to abort its wait loop.
++
++    Called from the interrupt path (chat_completion_helpers). The owning
++    thread sees cancel_event within ~0.1s (inbox poll quantum), aborts, and
++    evicts the session — so a stop actually stops, instead of the abandoned
++    thread holding sess.lock until the prompt deadline.
++    Returns the number of sessions signalled.
++    """
++    with _KEEP_ALIVE_REGISTRY_LOCK:
++        sessions = list(_KEEP_ALIVE_REGISTRY.values()) + list(_KEEP_ALIVE_BOOTING.values())
++    count = 0
++    for sess in sessions:
++        try:
++            evt = getattr(sess, "cancel_event", None)
++            if evt is not None and not evt.is_set():
++                evt.set()
++                count += 1
++        except Exception:
++            pass
++    if count:
++        logger.info("ACP keep-alive: cancel signalled to %d session(s) (%s)", count, reason)
++    return count
++
++
++def evict_acp_keep_alive_session(key: str, reason: str = "evict") -> None:
++    """Drop one keep-alive session so the next turn boots fresh.
++
++    Signals cancel first (in case the owner thread is still inside its
++    prompt loop), then closes the kernel process. Safe to call holding no
++    locks; never raises.
++    """
++    with _KEEP_ALIVE_REGISTRY_LOCK:
++        sess = _KEEP_ALIVE_REGISTRY.pop(key, None)
++    if sess is None:
++        return
++    try:
++        evt = getattr(sess, "cancel_event", None)
++        if evt is not None:
++            evt.set()
++    except Exception:
++        pass
++    try:
++        sess.close()
++    except Exception:
++        pass
++    logger.info("ACP keep-alive: evicted session (%s)", reason)
++
++
++# ── Kernel progress feed (Antigravity stderr telemetry) ─────────────────
++# The kernel logs its internal WS activity to stderr as
++# ``RAW WS MSG: {"<eventType>": {...}}`` — tool calls, step/usage updates,
++# policy gates. Same information the `agy` CLI TUI renders. We parse it
++# into a per-session progress dict; the Hermes wait loop reads it to show
++# live status instead of a generic "no response yet" notice.
++#
++# Robustness contract: the parser must NEVER raise and never crash the
++# request. Unknown event types / changed formats just bump the activity
++# timestamp (kernel is alive) and are otherwise ignored — worst case the
++# feed degrades to the pre-feature behavior.
++
++# Progress snapshots keyed by the *worker thread* ident running
++# chat.completions.create — the Hermes wait loop polls
++# get_acp_thread_progress(t.ident) and reads this exact dict (mutated by
++# the kernel's stderr reader thread; dict field writes are atomic enough).
++_ACP_THREAD_PROGRESS: dict[int, dict[str, Any]] = {}
++_ACP_THREAD_PROGRESS_LOCK = threading.Lock()
++
++
++def _set_thread_progress(progress: dict[str, Any] | None) -> None:
++    tid = threading.get_ident()
++    with _ACP_THREAD_PROGRESS_LOCK:
++        if progress is None:
++            _ACP_THREAD_PROGRESS.pop(tid, None)
++        else:
++            _ACP_THREAD_PROGRESS[tid] = progress
++
++
++def get_acp_thread_progress(thread_ident: int | None) -> dict[str, Any] | None:
++    """Progress dict for the given worker thread ident (or None)."""
++    if thread_ident is None:
++        return None
++    with _ACP_THREAD_PROGRESS_LOCK:
++        return _ACP_THREAD_PROGRESS.get(thread_ident)
++
++
++def _new_kernel_progress() -> dict[str, Any]:
++    return {
++        "last_event_ts": None,      # monotonic ts of ANY parseable kernel event
++        "last_desc": "",            # human-readable last activity
++        "last_desc_ts": None,       # monotonic ts of last_desc
++        "tools": 0,                 # toolCall events seen
++        "steps": 0,                 # stepUpdate events seen
++        # Token accounting (cumulative session values from usageUpdate —
++        # the kernel reports session totals; per-prompt deltas are computed
++        # by the prompt paths into "usage_delta").
++        "usage": {"prompt": 0, "completion": 0, "cached": 0},
++        "usage_delta": {"prompt": 0, "completion": 0, "cached": 0},
++    }
++
++
++def _brief_tool_args(arguments_json: str, limit: int = 40) -> str:
++    """Tiny human-readable hint from a tool's arguments JSON (path basename).
++
++    E.g. codegraph_explore {"Arguments":{"projectPath":"/Users/.../uniplus-api"}}
++    → " (uniplus-api)". Never raises; returns "" on anything unexpected.
++    """
++    try:
++        args = json.loads(arguments_json or "{}")
++    except Exception:
++        return ""
++    for _ in range(2):  # unwrap one {"Arguments": {...}} nesting level
++        if isinstance(args, dict) and len(args) == 1:
++            inner = next(iter(args.values()))
++            if isinstance(inner, dict):
++                args = inner
++                continue
++        break
++    if not isinstance(args, dict):
++        return ""
++    for key in ("AbsolutePath", "filePath", "path", "projectPath", "file_name", "filename"):
++        val = args.get(key)
++        if isinstance(val, str) and val.strip():
++            name = os.path.basename(val.strip().rstrip("/")) or val.strip()
++            return f" ({name[:limit]})"
++    if isinstance(args.get("content"), str) and args["content"].strip():
++        return " (write)"
++    return ""
++
++
++def _parse_kernel_stderr_line(line: str) -> dict[str, Any] | None:
++    """Parse one kernel stderr line → progress update (or None).
++
++    Returns {"desc": str|None, "usage": dict|None, "any": True}. Pure
++    function — unit-testable with real kernel log lines. Never raises.
++    """
++    if not isinstance(line, str) or "RAW WS MSG" not in line:
++        return None
++    m = re.search(r"RAW WS MSG:\s*(\{.*\})", line)
++    if not m:
++        return None
++    try:
++        msg = json.loads(m.group(1))
++    except Exception:
++        return None
++    if not isinstance(msg, dict) or not msg:
++        return None
++    result: dict[str, Any] = {"desc": None, "usage": None, "any": True}
++    kind, payload = next(iter(msg.items()))
++    try:
++        if kind == "toolCall" and isinstance(payload, dict):
++            name = str(payload.get("name") or "tool")
++            result["desc"] = f"{name}{_brief_tool_args(str(payload.get('argumentsJson') or ''))}"
++            result["tools"] = 1
++        elif kind == "stepUpdate" and isinstance(payload, dict):
++            idx = payload.get("stepIndex")
++            total = payload.get("totalSteps")
++            if isinstance(idx, int):
++                suffix = f"/{total}" if isinstance(total, int) else ""
++                result["desc"] = f"passo {idx + 1}{suffix}"
++            result["steps"] = 1
++        elif kind == "usageUpdate":
++            usage = payload.get("usage") if isinstance(payload, dict) else None
++            if not isinstance(usage, dict):
++                usage = payload
++            # The kernel wraps per-agent usage in an "agents" list; sum them.
++            agents = payload.get("agents") if isinstance(payload, dict) else None
++            if isinstance(agents, list) and agents:
++                summed = {"prompt": 0, "completion": 0, "cached": 0}
++                for entry in agents:
++                    if not isinstance(entry, dict):
++                        continue
++                    u = entry.get("usage") if isinstance(entry.get("usage"), dict) else entry
++                    if not isinstance(u, dict):
++                        continue
++
++                    def _u2(*keys: str) -> int:
++                        for k in keys:
++                            v = u.get(k) if isinstance(u, dict) else None
++                            if v is None:
++                                continue
++                            try:
++                                return int(v)
++                            except (TypeError, ValueError):
++                                continue
++                        return 0
++
++                    summed["prompt"] += _u2("promptTokenCount", "inputTokens")
++                    summed["completion"] += _u2("completionTokenCount", "outputTokens")
++                    summed["cached"] += _u2("cachedCacheReadTokenCount", "cachedInputTokens")
++                result["usage"] = summed
++            elif isinstance(usage, dict):
++                def _u(*keys: str) -> int:
++                    for k in keys:
++                        v = usage.get(k)
++                        if v is None:
++                            continue
++                        try:
++                            return int(v)
++                        except (TypeError, ValueError):
++                            continue
++                    return 0
++                result["usage"] = {
++                    "prompt": _u("promptTokenCount", "inputTokens"),
++                    "completion": _u("completionTokenCount", "outputTokens"),
++                    "cached": _u("cachedCacheReadTokenCount", "cachedInputTokens"),
++                }
++        elif kind == "policyDecisionRequest" and isinstance(payload, dict):
++            tool_args = payload.get("toolArgs") or {}
++            tname = str((tool_args.get("toolName") if isinstance(tool_args, dict) else None) or "ação")
++            result["desc"] = f"aguardando permissão: {tname}"
++        elif kind == "trajectoryStateUpdate":
++            state = str((payload.get("state") if isinstance(payload, dict) else None) or "")
++            if state and state != "STATE_RUNNING":
++                result["desc"] = f"estado: {state}"
++        # callHookRequest and anything else: activity only (no desc)
++    except Exception:
++        result["desc"] = None
++        result["usage"] = None
++    return result
++
++
++def _apply_kernel_progress(progress: dict[str, Any], parsed: dict[str, Any]) -> None:
++    """Fold one parsed stderr event into the shared progress dict.
++
++    Live trail: every NEW activity desc is also logged at info level so
++    agent.log (/dashboard logs) shows the kernel working in real time
++    (toolCall → stepUpdate → …), not just the final usage line. Both
++    call sites are already gated to the antigravity feed, so this never
++    fires for copilot-acp. Never raises.
++    """
++    now = time.monotonic()
++    progress["last_event_ts"] = now
++    desc = parsed.get("desc")
++    if desc:
++        try:
++            if desc != progress.get("last_desc"):
++                logger.info("Antigravity ACP kernel: %s", desc)
++        except Exception:
++            pass
++        progress["last_desc"] = desc
++        progress["last_desc_ts"] = now
++    if parsed.get("steps"):
++        progress["steps"] = progress.get("steps", 0) + 1
++    if parsed.get("tools"):
++        progress["tools"] = progress.get("tools", 0) + 1
++    usage = parsed.get("usage")
++    if isinstance(usage, dict):
++        for k in ("prompt", "completion", "cached"):
++            v = usage.get(k) or 0
++            if v > 0:
++                progress["usage"][k] = max(progress["usage"].get(k, 0), v)
++
++
++def _finalize_progress_usage(progress: dict[str, Any], prev_usage: dict[str, Any]) -> None:
++    """Compute per-prompt usage delta from cumulative usageUpdate values."""
++    delta = {"prompt": 0, "completion": 0, "cached": 0}
++    cur = progress.get("usage") or {}
++    for k in delta:
++        cur_v = int(cur.get(k) or 0)
++        prev_v = int(prev_usage.get(k) or 0)
++        delta[k] = max(0, cur_v - prev_v)
++    progress["usage_delta"] = delta
++
++
++def _log_kernel_usage(progress: dict[str, Any], session_id: str) -> None:
++    """Log the real kernel token counts (kills the `in=0 out=0` lie)."""
++    d = progress.get("usage_delta") or {}
++    if d.get("prompt") or d.get("completion"):
++        logger.info(
++            "Antigravity ACP kernel usage (session %s): in=%s out=%s cached=%s",
++            session_id, d.get("prompt", 0), d.get("completion", 0), d.get("cached", 0),
++        )
++
++
++def _progress_activity_summary(progress: dict[str, Any] | None) -> str:
++    """One-line activity summary for timeout/diagnostic messages."""
++    if not progress:
++        return ""
++    desc = progress.get("last_desc")
++    last_ts = progress.get("last_event_ts")
++    now = time.monotonic()
++    if desc or last_ts:
++        age = f" há {int(max(0, now - last_ts))}s" if last_ts else ""
++        return f"última atividade: {desc or 'evento'}{age}."
++    return ""
++
 +
 +class _PersistentACPSession:
-+    def __init__(self, key: str, command: str, args: list[str], cwd: str, proc: Any, inbox: Any, stderr_tail: Any, out_thread: Any, err_thread: Any, session_id: str):
++    def __init__(self, key: str, command: str, args: list[str], cwd: str, proc: Any, inbox: Any, stderr_tail: Any, out_thread: Any, err_thread: Any, session_id: str, progress: dict[str, Any] | None = None):
 +        self.key = key
 +        self.command = command
 +        self.args = list(args)
@@ -254,6 +1050,13 @@ index a547895b2..25cc95200 100644
 +        self.last_mode: str | None = None
 +        self.lock = threading.Lock()
 +        self.created_at = time.monotonic()
++        # Kernel progress telemetry (stderr feed) — mutated by err_thread.
++        self.progress: dict[str, Any] = progress if progress is not None else _new_kernel_progress()
++        # Set by cancel_acp_keep_alive_sessions() (interrupt path). Every
++        # inbox wait loop in this module polls it each 0.1s iteration, so a
++        # user stop aborts within ~0.1s instead of running to the deadline
++        # while holding self.lock.
++        self.cancel_event = threading.Event()
 +
 +    def is_alive(self) -> bool:
 +        try:
@@ -279,7 +1082,7 @@ index a547895b2..25cc95200 100644
  def _jsonrpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
      return {
          "jsonrpc": "2.0",
-@@ -190,6 +286,7 @@ def _format_messages_as_prompt(
+@@ -190,6 +648,7 @@ def _format_messages_as_prompt(
      model: str | None = None,
      tools: list[dict[str, Any]] | None = None,
      tool_choice: Any = None,
@@ -287,7 +1090,7 @@ index a547895b2..25cc95200 100644
  ) -> str:
      sections: list[str] = [
          "You are being used as the active ACP agent backend for Hermes.",
-@@ -200,9 +297,11 @@ def _format_messages_as_prompt(
+@@ -200,9 +659,11 @@ def _format_messages_as_prompt(
      if model:
          sections.append(f"Hermes requested model hint: {model}")
  
@@ -302,7 +1105,7 @@ index a547895b2..25cc95200 100644
  
      transcript: list[str] = []
      for message in messages:
-@@ -305,8 +404,13 @@ class CopilotACPClient:
+@@ -305,8 +766,13 @@ class CopilotACPClient:
          self.base_url = base_url or ACP_MARKER_BASE_URL
          self._default_headers = dict(default_headers or {})
          self._acp_command = acp_command or command or _resolve_command()
@@ -317,7 +1120,7 @@ index a547895b2..25cc95200 100644
          self.chat = _ACPChatNamespace(self)
          self.is_closed = False
          self._active_process: subprocess.Popen[str] | None = None
-@@ -340,11 +444,17 @@ class CopilotACPClient:
+@@ -340,12 +806,31 @@ class CopilotACPClient:
          stream: bool = False,
          **_: Any,
      ) -> Any:
@@ -333,45 +1136,186 @@ index a547895b2..25cc95200 100644
              tool_choice=tool_choice,
 +            lean=_lean,
          )
++        # Context pack: only for Antigravity — anexa memória do perfil +
++        # skills de domínio que o kernel não vê no transcript (ele não tem
++        # system prompt estruturado nem skill_view como os nativos).
++        # Nunca quebra o request: falha → sem pack.
++        if str(self.base_url or "").startswith("acp://antigravity"):
++            try:
++                from agent.acp_context_pack import build_context_pack
++
++                pack = build_context_pack(messages or [])
++                if pack:
++                    prompt_text = prompt_text + "\n\n" + pack
++            except Exception as _pack_err:  # pragma: no cover - defensivo
++                logger.debug("acp context pack skip (%s)", _pack_err)
          # Normalise timeout: run_agent.py may pass an httpx.Timeout object
          # (used natively by the OpenAI SDK) rather than a plain float.
-@@ -365,6 +475,7 @@ class CopilotACPClient:
-         response_text, reasoning_text = self._run_prompt(
+         if timeout is None:
+@@ -362,9 +847,10 @@ class CopilotACPClient:
+             _numeric = [float(v) for v in _candidates if isinstance(v, (int, float))]
+             _effective_timeout = max(_numeric) if _numeric else _DEFAULT_TIMEOUT_SECONDS
+ 
+-        response_text, reasoning_text = self._run_prompt(
++        response_text, reasoning_text, _progress_ref = self._run_prompt(
              prompt_text,
              timeout_seconds=_effective_timeout,
 +            model=model,
          )
  
          tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
-@@ -393,7 +504,9 @@ class CopilotACPClient:
+@@ -375,6 +861,20 @@ class CopilotACPClient:
+             total_tokens=0,
+             prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+         )
++        # Real kernel token counts from the progress feed (usageUpdate) —
++        # the conversation_loop log then shows `in=N out=M` instead of 0/0.
++        if _progress_ref is not None:
++            try:
++                _delta = _progress_ref.get("usage_delta") or {}
++                _pt = int(_delta.get("prompt") or 0)
++                _ct = int(_delta.get("completion") or 0)
++                if _pt or _ct:
++                    usage.prompt_tokens = _pt
++                    usage.completion_tokens = _ct
++                    usage.total_tokens = _pt + _ct
++                    usage.prompt_tokens_details.cached_tokens = int(_delta.get("cached") or 0)
++            except Exception:
++                pass
+         assistant_message = SimpleNamespace(
+             content=cleaned_text,
+             tool_calls=tool_calls,
+@@ -393,29 +893,63 @@ class CopilotACPClient:
              return _completion_to_stream_chunks(completion)
          return completion
  
 -    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+-        # Fast-fail when the CLI doesn't support the ACP args we'd pass.
+-        # Without this guard, a CLI like Claude Code v2.x exits with
+-        # ``error: unknown option '--acp'`` immediately, then the parent
+-        # ACP loop waits the full ``child_timeout_seconds`` (default 600s)
+-        # for stdout that never arrives. The probe costs ~50ms and turns
+-        # a 600s silent hang into a 280ms clear error.
+-        # ``None`` (inconclusive probe — e.g. binary missing) falls
+-        # through to the spawn below, which raises the established
+-        # "Could not start Copilot ACP command" error.
+-        if _acp_supported(self._acp_command, self._acp_args) is False:
+-            preview = " ".join(self._acp_args[:3]) if self._acp_args else "(none)"
+-            raise RuntimeError(
+-                f"ACP transport not supported by '{self._acp_command}': "
+-                f"`{preview}` is rejected as an unknown option. "
+-                f"This usually means the CLI is an older release (e.g. "
+-                f"Claude Code v2.x) or a different tool than expected. "
+-                f"Either install a CLI that ships with --acp support "
+-                f"(e.g. `@github/copilot` late 2025+), or set "
+-                f"HERMES_COPILOT_ACP_COMMAND / HERMES_COPILOT_ACP_ARGS "
+-                f"to a working pair."
+-            )
 +    def _run_prompt(
 +        self, prompt_text: str, *, timeout_seconds: float, model: str | None = None
-+    ) -> tuple[str, str]:
-         # Fast-fail when the CLI doesn't support the ACP args we'd pass.
-         # Without this guard, a CLI like Claude Code v2.x exits with
-         # ``error: unknown option '--acp'`` immediately, then the parent
-@@ -416,6 +529,16 @@ class CopilotACPClient:
-                 f"to a working pair."
-             )
- 
-+        # ── Keep-alive path (Zed-like: one kernel per cwd) ──────────────
-+        # When enabled (model.acp_keep_alive or HERMES_ANTIGRAVITY_ACP_KEEP_ALIVE),
-+        # we keep the ACP process + sessionId alive across Hermes turns.
-+        # Only for Antigravity (the kernel that benefits most — 5-10s boot,
-+        # quota re-read). Copilot keeps the old per-request behavior.
-+        _keep_alive = _is_keep_alive_enabled() and str(self.base_url or "").startswith("acp://antigravity")
-+        if _keep_alive:
-+            return self._run_prompt_keep_alive(prompt_text, timeout_seconds=timeout_seconds, model=model)
++    ) -> tuple[str, str, dict[str, Any] | None]:
++        # Progress feed: expose the kernel telemetry dict to the Hermes wait
++        # loop via the worker-thread registry. The holder starts empty — the
++        # keep-alive/ephemeral path fills holder["ref"] with the live dict
++        # once it exists (keep-alive: sess.progress; ephemeral: local dict).
++        progress_holder: dict[str, Any] | None = None
++        if str(self.base_url or "").startswith("acp://antigravity") and _is_progress_feed_enabled():
++            progress_holder = {"ref": None}
++            _set_thread_progress(progress_holder)
++        try:
++            # Fast-fail when the CLI doesn't support the ACP args we'd pass.
++            # Without this guard, a CLI like Claude Code v2.x exits with
++            # ``error: unknown option '--acp'`` immediately, then the parent
++            # ACP loop waits the full ``child_timeout_seconds`` (default 600s)
++            # for stdout that never arrives. The probe costs ~50ms and turns
++            # a 600s silent hang into a 280ms clear error.
++            # ``None`` (inconclusive probe — e.g. binary missing) falls
++            # through to the spawn below, which raises the established
++            # "Could not start Copilot ACP command" error.
++            if _acp_supported(self._acp_command, self._acp_args) is False:
++                preview = " ".join(self._acp_args[:3]) if self._acp_args else "(none)"
++                raise RuntimeError(
++                    f"ACP transport not supported by '{self._acp_command}': "
++                    f"`{preview}` is rejected as an unknown option. "
++                    f"This usually means the CLI is an older release (e.g. "
++                    f"Claude Code v2.x) or a different tool than expected. "
++                    f"Either install a CLI that ships with --acp support "
++                    f"(e.g. `@github/copilot` late 2025+), or set "
++                    f"HERMES_COPILOT_ACP_COMMAND / HERMES_COPILOT_ACP_ARGS "
++                    f"to a working pair."
++                )
 +
++            # ── Keep-alive path (Zed-like: one kernel per cwd) ──────────────
++            # When enabled (model.acp_keep_alive or HERMES_ANTIGRAVITY_ACP_KEEP_ALIVE),
++            # we keep the ACP process + sessionId alive across Hermes turns.
++            # Only for Antigravity (the kernel that benefits most — 5-10s boot,
++            # quota re-read). Copilot keeps the old per-request behavior.
++            _keep_alive = _is_keep_alive_enabled() and str(self.base_url or "").startswith("acp://antigravity")
++            if _keep_alive:
++                _text, _reasoning = self._run_prompt_keep_alive(
++                    prompt_text, timeout_seconds=timeout_seconds, model=model, progress_holder=progress_holder
++                )
++            else:
++                _text, _reasoning = self._run_prompt_ephemeral_locked(
++                    prompt_text, timeout_seconds=timeout_seconds, model=model, progress_holder=progress_holder
++                )
++            return _text, _reasoning, (progress_holder or {}).get("ref") if progress_holder else None
++        finally:
++            if progress_holder is not None:
++                _set_thread_progress(None)
+ 
++    def _run_prompt_ephemeral_locked(
++        self, prompt_text: str, *, timeout_seconds: float, model: str | None = None, progress_holder: dict[str, Any] | None = None
++    ) -> tuple[str, str]:
 +        # ── Ephemeral path (default): fresh kernel per request ──────────
          try:
              # Hide the console the CLI child would otherwise flash on Windows
              # (#56747). Hide-only — stdio pipes stay intact for the ACP wire.
-@@ -560,6 +683,59 @@ class CopilotACPClient:
+@@ -448,6 +982,14 @@ class CopilotACPClient:
+ 
+         inbox: queue.Queue[dict[str, Any]] = queue.Queue()
+         stderr_tail: deque[str] = deque(maxlen=40)
++        # Progress telemetry for the stderr feed (ephemeral path).
++        _feed_enabled_eph = (
++            str(self.base_url or "").startswith("acp://antigravity")
++            and _is_progress_feed_enabled()
++        )
++        progress_eph = _new_kernel_progress()
++        if progress_holder is not None:
++            progress_holder["ref"] = progress_eph
+ 
+         def _stdout_reader() -> None:
+             if proc.stdout is None:
+@@ -463,6 +1005,14 @@ class CopilotACPClient:
+                 return
+             for line in proc.stderr:
+                 stderr_tail.append(line.rstrip("\n"))
++                if _feed_enabled_eph:
++                    try:
++                        parsed = _parse_kernel_stderr_line(line)
++                        if parsed:
++                            _apply_kernel_progress(progress_eph, parsed)
++                    except Exception:
++                        # The feed must never break the kernel reader.
++                        pass
+ 
+         out_thread = threading.Thread(target=_stdout_reader, daemon=True)
+         err_thread = threading.Thread(target=_stderr_reader, daemon=True)
+@@ -529,7 +1079,12 @@ class CopilotACPClient:
+                         f"Original error:\n{stderr_text}"
+                     )
+                 raise RuntimeError(f"Copilot ACP process exited early: {stderr_text}")
+-            raise TimeoutError(f"Timed out waiting for Copilot ACP response to {method}.")
++            _activity_eph = _progress_activity_summary(progress_eph)
++            raise TimeoutError(
++                f"Timed out waiting for Copilot ACP response to {method}. {_activity_eph} stderr: {stderr_text}"
++                if _activity_eph
++                else f"Timed out waiting for Copilot ACP response to {method}."
++            )
+ 
+         try:
+             _request(
+@@ -560,8 +1115,62 @@ class CopilotACPClient:
              if not session_id:
                  raise RuntimeError("Copilot ACP did not return a sessionId.")
  
@@ -430,13 +1374,29 @@ index a547895b2..25cc95200 100644
 +
              text_parts: list[str] = []
              reasoning_parts: list[str] = []
++            _prev_usage_eph = dict(progress_eph.get("usage") or {})
              _request(
-@@ -580,6 +756,300 @@ class CopilotACPClient:
+                 "session/prompt",
+                 {
+@@ -576,10 +1185,501 @@ class CopilotACPClient:
+                 text_parts=text_parts,
+                 reasoning_parts=reasoning_parts,
+             )
++            _finalize_progress_usage(progress_eph, _prev_usage_eph)
++            _log_kernel_usage(progress_eph, session_id)
+             return "".join(text_parts), "".join(reasoning_parts)
          finally:
              self.close()
  
 +    def _create_persistent_session(self, key: str, timeout_seconds: float, model: str | None = None) -> "_PersistentACPSession":
-+        """Spawn a new ACP kernel and create a session. Caller holds _KEEP_ALIVE_REGISTRY_LOCK."""
++        """Spawn a new ACP kernel and create a session.
++
++        Must be called WITHOUT holding _KEEP_ALIVE_REGISTRY_LOCK (the boot
++        takes seconds; the registry lock is only for dict lookup/insert).
++        ``timeout_seconds`` here is the BOOT budget — callers pass
++        _boot_timeout_seconds() (≈60s), never the prompt deadline.
++        On any failure the spawned process is terminated (no orphans).
++        """
 +        from hermes_cli._subprocess_compat import windows_hide_flags
 +
 +        try:
@@ -463,6 +1423,13 @@ index a547895b2..25cc95200 100644
 +
 +        inbox: queue.Queue[dict[str, Any]] = queue.Queue()
 +        stderr_tail: deque[str] = deque(maxlen=40)
++        # Progress telemetry for the stderr feed (progress feed ON). The
++        # reader thread mutates this dict; sess.progress is the same object.
++        _feed_enabled = (
++            str(self.base_url or "").startswith("acp://antigravity")
++            and _is_progress_feed_enabled()
++        )
++        progress = _new_kernel_progress()
 +
 +        def _stdout_reader() -> None:
 +            if proc.stdout is None:
@@ -478,6 +1445,14 @@ index a547895b2..25cc95200 100644
 +                return
 +            for line in proc.stderr:
 +                stderr_tail.append(line.rstrip("\n"))
++                if _feed_enabled:
++                    try:
++                        parsed = _parse_kernel_stderr_line(line)
++                        if parsed:
++                            _apply_kernel_progress(progress, parsed)
++                    except Exception:
++                        # The feed must never break the kernel reader.
++                        pass
 +
 +        out_thread = threading.Thread(target=_stdout_reader, daemon=True)
 +        err_thread = threading.Thread(target=_stderr_reader, daemon=True)
@@ -486,6 +1461,11 @@ index a547895b2..25cc95200 100644
 +
 +        # Minimal request pump for bootstrap (no session yet, so no agent updates to collect)
 +        next_id = 0
++        _boot_start = time.monotonic()
++        # sess is created below before bootstrap so the boot is cancellable
++        # (cancel_event registered in _KEEP_ALIVE_BOOTING).
++        _boot_sess_ref: list = []
++
 +        def _boot_request(method: str, params: dict[str, Any]) -> Any:
 +            nonlocal next_id
 +            next_id += 1
@@ -494,6 +1474,8 @@ index a547895b2..25cc95200 100644
 +            proc.stdin.flush()
 +            deadline = time.monotonic() + timeout_seconds
 +            while time.monotonic() < deadline:
++                if _boot_sess_ref and _boot_sess_ref[0].cancel_event.is_set():
++                    raise RuntimeError("Copilot ACP boot interrupted.")
 +                if proc.poll() is not None:
 +                    break
 +                try:
@@ -511,132 +1493,271 @@ index a547895b2..25cc95200 100644
 +                    err = msg.get("error") or {}
 +                    raise RuntimeError(f"Copilot ACP {method} failed: {err.get('message') or err}")
 +                return msg.get("result")
++            if _boot_sess_ref and _boot_sess_ref[0].cancel_event.is_set():
++                raise RuntimeError("Copilot ACP boot interrupted.")
 +            stderr_text = "\n".join(stderr_tail).strip()
++            elapsed = time.monotonic() - _boot_start
 +            if proc.poll() is not None and stderr_text:
 +                raise RuntimeError(f"Copilot ACP process exited early: {stderr_text}")
-+            raise TimeoutError(f"Timed out waiting for Copilot ACP response to {method}.")
++            # Timeout: surface elapsed time + kernel stderr so the next hang
++            # is diagnosable from agent.log alone (badea4 had neither).
++            if stderr_text:
++                tail = "\n".join(stderr_text.splitlines()[-10:])
++                logger.warning(
++                    "Copilot ACP boot %s timed out after %.0fs (cwd=%s). stderr: %s",
++                    method, elapsed, self._acp_cwd, tail,
++                )
++                raise TimeoutError(
++                    f"Timed out waiting for Copilot ACP response to {method} after {elapsed:.0f}s. stderr: {tail}"
++                )
++            logger.warning(
++                "Copilot ACP boot %s timed out after %.0fs (cwd=%s, no stderr)",
++                method, elapsed, self._acp_cwd,
++            )
++            raise TimeoutError(f"Timed out waiting for Copilot ACP response to {method} after {elapsed:.0f}s.")
 +
-+        sess = _PersistentACPSession(key, self._acp_command, self._acp_args, self._acp_cwd, proc, inbox, stderr_tail, out_thread, err_thread, "")
++        sess = _PersistentACPSession(key, self._acp_command, self._acp_args, self._acp_cwd, proc, inbox, stderr_tail, out_thread, err_thread, "", progress=progress)
++        _boot_sess_ref.append(sess)
++        with _KEEP_ALIVE_REGISTRY_LOCK:
++            _KEEP_ALIVE_BOOTING[key] = sess
 +        sess.next_id = next_id  # will be updated after bootstrap
-+        # Bootstrap
-+        _boot_request("initialize", {"protocolVersion": 1, "clientCapabilities": {"fs": {"readTextFile": True, "writeTextFile": True}}, "clientInfo": {"name": "hermes-agent", "title": "Hermes Agent", "version": "0.0.0"}})
-+        session = _boot_request("session/new", {"cwd": self._acp_cwd, "mcpServers": []}) or {}
-+        session_id = str(session.get("sessionId") or "").strip()
-+        if not session_id:
-+            try:
-+                proc.terminate()
-+            except Exception:
-+                pass
-+            raise RuntimeError("Copilot ACP did not return a sessionId.")
-+        sess.session_id = session_id
-+        sess.next_id = next_id + 1
-+        # Capture available models
++        # Bootstrap — any failure terminates the process (no orphans) and
++        # unregisters the booting marker.
 +        try:
-+            kernel_models = ((session.get("models") or {}).get("availableModels")) or []
-+            sess.kernel_model_ids = {str(m.get("modelId") or "").strip() for m in kernel_models if isinstance(m, dict)}
-+        except Exception:
-+            sess.kernel_model_ids = set()
-+        # Apply initial model/mode if needed (best-effort)
-+        if str(self.base_url or "").startswith("acp://antigravity"):
-+            if model and model in sess.kernel_model_ids:
++            _boot_request("initialize", {"protocolVersion": 1, "clientCapabilities": {"fs": {"readTextFile": True, "writeTextFile": True}}, "clientInfo": {"name": "hermes-agent", "title": "Hermes Agent", "version": "0.0.0"}})
++            session = _boot_request("session/new", {"cwd": self._acp_cwd, "mcpServers": []}) or {}
++            session_id = str(session.get("sessionId") or "").strip()
++            if not session_id:
 +                try:
-+                    # Use sess's own request pump (need helper that uses sess.next_id)
-+                    rid = sess.next_id
-+                    sess.next_id += 1
-+                    proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "session/set_config_option", "params": {"sessionId": session_id, "configId": "model", "value": model}}) + "\n")
-+                    proc.stdin.flush()
-+                    # Wait for ack (reuse same logic but simplified: poll inbox)
-+                    deadline = time.monotonic() + min(15, timeout_seconds)
-+                    while time.monotonic() < deadline:
-+                        if proc.poll() is not None:
-+                            break
-+                        try:
-+                            msg = inbox.get(timeout=0.1)
-+                        except queue.Empty:
-+                            continue
-+                        if isinstance(msg.get("method"), str):
-+                            self._handle_server_message(msg, process=proc, cwd=self._acp_cwd, text_parts=None, reasoning_parts=None)
-+                            continue
-+                        if msg.get("id") != rid:
-+                            continue
-+                        break
-+                    sess.last_model = model
-+                    logger.info("Antigravity ACP keep-alive: session model set to %s", model)
++                    proc.terminate()
 +                except Exception:
 +                    pass
-+            # Mode
++                raise RuntimeError("Copilot ACP did not return a sessionId.")
++            sess.session_id = session_id
++            sess.next_id = next_id + 1
++            # Capture available models
 +            try:
-+                _mode = os.getenv("HERMES_ANTIGRAVITY_ACP_MODE", "").strip().lower()
-+                if not _mode:
-+                    from hermes_cli.config import load_config_readonly
-+                    _cfg = load_config_readonly()
-+                    _mode = str(((_cfg.get("model") or {}).get("acp_mode") or "")).strip().lower()
-+                if _mode in {"default", "auto_edit", "yolo"}:
-+                    rid = sess.next_id
-+                    sess.next_id += 1
-+                    proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "session/set_config_option", "params": {"sessionId": session_id, "configId": "mode", "value": _mode}}) + "\n")
-+                    proc.stdin.flush()
-+                    deadline = time.monotonic() + min(10, timeout_seconds)
-+                    while time.monotonic() < deadline:
-+                        if proc.poll() is not None:
-+                            break
-+                        try:
-+                            msg = inbox.get(timeout=0.1)
-+                        except queue.Empty:
-+                            continue
-+                        if isinstance(msg.get("method"), str):
-+                            self._handle_server_message(msg, process=proc, cwd=self._acp_cwd, text_parts=None, reasoning_parts=None)
-+                            continue
-+                        if msg.get("id") != rid:
-+                            continue
-+                        break
-+                    sess.last_mode = _mode
-+                    logger.info("Antigravity ACP keep-alive: session mode set to %s", _mode)
++                kernel_models = ((session.get("models") or {}).get("availableModels")) or []
++                sess.kernel_model_ids = {str(m.get("modelId") or "").strip() for m in kernel_models if isinstance(m, dict)}
 +            except Exception:
-+                pass
-+        logger.info("Antigravity ACP keep-alive: new persistent session %s (cwd=%s)", session_id, self._acp_cwd)
-+        return sess
++                sess.kernel_model_ids = set()
++            # Apply initial model/mode if needed (best-effort)
++            if str(self.base_url or "").startswith("acp://antigravity"):
++                if model and model in sess.kernel_model_ids:
++                    try:
++                        # Use sess's own request pump (need helper that uses sess.next_id)
++                        rid = sess.next_id
++                        sess.next_id += 1
++                        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "session/set_config_option", "params": {"sessionId": session_id, "configId": "model", "value": model}}) + "\n")
++                        proc.stdin.flush()
++                        # Wait for ack (reuse same logic but simplified: poll inbox)
++                        deadline = time.monotonic() + min(15, timeout_seconds)
++                        while time.monotonic() < deadline:
++                            if sess.cancel_event.is_set():
++                                break
++                            if proc.poll() is not None:
++                                break
++                            try:
++                                msg = inbox.get(timeout=0.1)
++                            except queue.Empty:
++                                continue
++                            if isinstance(msg.get("method"), str):
++                                self._handle_server_message(msg, process=proc, cwd=self._acp_cwd, text_parts=None, reasoning_parts=None)
++                                continue
++                            if msg.get("id") != rid:
++                                continue
++                            break
++                        sess.last_model = model
++                        logger.info("Antigravity ACP keep-alive: session model set to %s", model)
++                    except Exception:
++                        pass
++                # Mode
++                try:
++                    _mode = os.getenv("HERMES_ANTIGRAVITY_ACP_MODE", "").strip().lower()
++                    if not _mode:
++                        from hermes_cli.config import load_config_readonly
++                        _cfg = load_config_readonly()
++                        _mode = str(((_cfg.get("model") or {}).get("acp_mode") or "")).strip().lower()
++                    if _mode in {"default", "auto_edit", "yolo"}:
++                        rid = sess.next_id
++                        sess.next_id += 1
++                        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "session/set_config_option", "params": {"sessionId": session_id, "configId": "mode", "value": _mode}}) + "\n")
++                        proc.stdin.flush()
++                        deadline = time.monotonic() + min(10, timeout_seconds)
++                        while time.monotonic() < deadline:
++                            if sess.cancel_event.is_set():
++                                break
++                            if proc.poll() is not None:
++                                break
++                            try:
++                                msg = inbox.get(timeout=0.1)
++                            except queue.Empty:
++                                continue
++                            if isinstance(msg.get("method"), str):
++                                self._handle_server_message(msg, process=proc, cwd=self._acp_cwd, text_parts=None, reasoning_parts=None)
++                                continue
++                            if msg.get("id") != rid:
++                                continue
++                            break
++                        sess.last_mode = _mode
++                        logger.info("Antigravity ACP keep-alive: session mode set to %s", _mode)
++                except Exception:
++                    pass
++            logger.info(
++                "Antigravity ACP keep-alive: new persistent session %s (cwd=%s, boot %.1fs)",
++                session_id, self._acp_cwd, time.monotonic() - _boot_start,
++            )
++            with _KEEP_ALIVE_REGISTRY_LOCK:
++                _KEEP_ALIVE_BOOTING.pop(key, None)
++            return sess
++        except Exception:
++            with _KEEP_ALIVE_REGISTRY_LOCK:
++                _KEEP_ALIVE_BOOTING.pop(key, None)
++            try:
++                proc.terminate()
++                proc.wait(timeout=2)
++            except Exception:
++                try:
++                    proc.kill()
++                except Exception:
++                    pass
++            raise
 +
-+    def _run_prompt_keep_alive(self, prompt_text: str, *, timeout_seconds: float, model: str | None = None) -> tuple[str, str]:
-+        key = _keep_alive_key(self._acp_command, self._acp_args, self._acp_cwd)
-+        # Evict dead sessions lazily and get/create
-+        sess: "_PersistentACPSession | None" = None
++    def _get_or_boot_keep_alive(self, key: str, boot_timeout: float, model: str | None) -> "_PersistentACPSession":
++        """Return the live keep-alive session for ``key``, booting if needed.
++
++        The registry lock is held ONLY for dict lookup/insert — never across
++        the multi-second kernel spawn. Concurrent turns needing the same
++        kernel wait on a boot event (bounded) instead of piling onto the
++        registry lock with zero diagnostics (the badea4 hang).
++        """
 +        with _KEEP_ALIVE_REGISTRY_LOCK:
 +            sess = _KEEP_ALIVE_REGISTRY.get(key)
 +            if sess is not None and not sess.is_alive():
-+                try:
-+                    sess.close()
-+                except Exception:
-+                    pass
 +                _KEEP_ALIVE_REGISTRY.pop(key, None)
-+                sess = None
-+            if sess is None:
-+                sess = self._create_persistent_session(key, timeout_seconds, model)
-+                _KEEP_ALIVE_REGISTRY[key] = sess
-+        # Serialize requests on this kernel (ACP is not parallel)
-+        with sess.lock:
-+            # Recheck liveness after acquiring lock (another thread may have killed it)
-+            if not sess.is_alive():
-+                with _KEEP_ALIVE_REGISTRY_LOCK:
-+                    _KEEP_ALIVE_REGISTRY.pop(key, None)
 +                try:
 +                    sess.close()
 +                except Exception:
 +                    pass
-+                # Create fresh and retry once
-+                with _KEEP_ALIVE_REGISTRY_LOCK:
-+                    sess = self._create_persistent_session(key, timeout_seconds, model)
-+                    _KEEP_ALIVE_REGISTRY[key] = sess
-+                # Need its lock for the fresh session
-+                # Since we are inside old sess lock, release it first by recursive call
-+                sess.lock.acquire()
-+                try:
-+                    return self._do_keep_alive_prompt(sess, prompt_text, timeout_seconds, model)
-+                finally:
-+                    sess.lock.release()
-+            return self._do_keep_alive_prompt(sess, prompt_text, timeout_seconds, model)
++                sess = None
++            if sess is not None:
++                return sess
++            evt = _KEEP_ALIVE_BOOT_EVENTS.get(key)
++            if evt is None:
++                evt = threading.Event()
++                _KEEP_ALIVE_BOOT_EVENTS[key] = evt
++                need_boot = True
++            else:
++                need_boot = False
++        if not need_boot:
++            # Another turn is already booting this kernel — wait for it
++            # (bounded) instead of spawning a second kernel.
++            evt.wait(timeout=boot_timeout + 15)
++            with _KEEP_ALIVE_REGISTRY_LOCK:
++                sess = _KEEP_ALIVE_REGISTRY.get(key)
++                if sess is not None and sess.is_alive():
++                    return sess
++                if sess is not None:
++                    _KEEP_ALIVE_REGISTRY.pop(key, None)
++                if key not in _KEEP_ALIVE_BOOT_EVENTS:
++                    evt = threading.Event()
++                    _KEEP_ALIVE_BOOT_EVENTS[key] = evt
++                    need_boot = True
++                else:
++                    evt = _KEEP_ALIVE_BOOT_EVENTS[key]
++            if not need_boot:
++                raise TimeoutError(
++                    f"Timed out waiting for concurrent ACP kernel boot (cwd={self._acp_cwd})."
++                )
++        # We are the booter. Boot OUTSIDE the registry lock so a slow
++        # Google-side stall blocks only this turn — never the registry,
++        # never other cwds, never the auxiliary title task.
++        boot_start = time.monotonic()
++        logger.info(
++            "Antigravity ACP keep-alive: booting kernel (cwd=%s, boot budget %.0fs)",
++            self._acp_cwd, boot_timeout,
++        )
++        try:
++            new_sess = self._create_persistent_session(key, boot_timeout, model)
++        except Exception:
++            with _KEEP_ALIVE_REGISTRY_LOCK:
++                _KEEP_ALIVE_BOOT_EVENTS.pop(key, None)
++                evt.set()
++            raise
++        with _KEEP_ALIVE_REGISTRY_LOCK:
++            # Double-checked: another booter may have won while we booted.
++            # Keep the first, close ours (no orphan kernels).
++            existing = _KEEP_ALIVE_REGISTRY.get(key)
++            if existing is not None and existing.is_alive():
++                winner, loser = existing, new_sess
++            else:
++                if existing is not None:
++                    try:
++                        existing.close()
++                    except Exception:
++                        pass
++                _KEEP_ALIVE_REGISTRY[key] = new_sess
++                winner, loser = new_sess, None
++            _KEEP_ALIVE_BOOT_EVENTS.pop(key, None)
++            evt.set()
++        if loser is not None:
++            try:
++                loser.close()
++            except Exception:
++                pass
++            return winner
++        logger.info(
++            "Antigravity ACP keep-alive: kernel ready in %.1fs (cwd=%s)",
++            time.monotonic() - boot_start, self._acp_cwd,
++        )
++        return new_sess
 +
-+    def _do_keep_alive_prompt(self, sess: "_PersistentACPSession", prompt_text: str, timeout_seconds: float, model: str | None) -> tuple[str, str]:
++    def _run_prompt_keep_alive(self, prompt_text: str, *, timeout_seconds: float, model: str | None = None, progress_holder: dict[str, Any] | None = None) -> tuple[str, str]:
++        key = _keep_alive_key(self._acp_command, self._acp_args, self._acp_cwd)
++        boot_timeout = _boot_timeout_seconds(timeout_seconds)
++        last_error: Exception | None = None
++        for _ in range(2):
++            sess = self._get_or_boot_keep_alive(key, boot_timeout, model)
++            # Serialize requests on this kernel (ACP is not parallel). The
++            # wait is bounded by the caller's own deadline with diagnostics;
++            # a stop during the wait is handled via cancel_event by the
++            # holder, which aborts and evicts fast.
++            acquired = sess.lock.acquire(timeout=timeout_seconds)
++            if not acquired:
++                stderr_text = "\n".join(sess.stderr_tail).strip()
++                tail = "\n".join(stderr_text.splitlines()[-5:]) if stderr_text else "no stderr"
++                last_error = TimeoutError(
++                    f"Timed out ({timeout_seconds:.0f}s) waiting for the ACP keep-alive session lock "
++                    f"(cwd={self._acp_cwd}). Another turn holds the kernel. stderr: {tail}"
++                )
++                logger.warning("Antigravity ACP keep-alive: %s", last_error)
++                break
++            try:
++                if not sess.is_alive():
++                    # Died between get and lock — evict and retry once fresh.
++                    evict_acp_keep_alive_session(key, reason="dead-session")
++                    last_error = RuntimeError("ACP keep-alive session died before prompt.")
++                    continue
++                try:
++                    if progress_holder is not None:
++                        progress_holder["ref"] = sess.progress
++                    return self._do_keep_alive_prompt(sess, prompt_text, timeout_seconds, model, progress_holder)
++                except RuntimeError as exc:
++                    if "interrupt" in str(exc).lower():
++                        evict_acp_keep_alive_session(key, reason="interrupted")
++                    raise
++            finally:
++                try:
++                    sess.lock.release()
++                except RuntimeError:
++                    pass
++        if last_error is None:
++            last_error = TimeoutError(
++                f"ACP keep-alive session unavailable after retry (cwd={self._acp_cwd})."
++            )
++        raise last_error
++
++    def _do_keep_alive_prompt(self, sess: "_PersistentACPSession", prompt_text: str, timeout_seconds: float, model: str | None, progress_holder: dict[str, Any] | None = None) -> tuple[str, str]:
 +        proc = sess.proc
 +        inbox = sess.inbox
 +        stderr_tail = sess.stderr_tail
@@ -651,6 +1772,8 @@ index a547895b2..25cc95200 100644
 +                    proc.stdin.flush()
 +                    deadline = time.monotonic() + min(15, timeout_seconds)
 +                    while time.monotonic() < deadline:
++                        if sess.cancel_event.is_set():
++                            raise RuntimeError("ACP prompt interrupted.")
 +                        if proc.poll() is not None:
 +                            break
 +                        try:
@@ -666,6 +1789,8 @@ index a547895b2..25cc95200 100644
 +                    sess.last_model = model
 +                    logger.info("Antigravity ACP keep-alive: session model switched to %s", model)
 +                except Exception as exc:
++                    if "interrupt" in str(exc).lower():
++                        raise
 +                    logger.warning("Antigravity ACP keep-alive model switch failed: %s", exc)
 +            # Mode switch
 +            try:
@@ -681,6 +1806,8 @@ index a547895b2..25cc95200 100644
 +                    proc.stdin.flush()
 +                    deadline = time.monotonic() + min(10, timeout_seconds)
 +                    while time.monotonic() < deadline:
++                        if sess.cancel_event.is_set():
++                            raise RuntimeError("ACP prompt interrupted.")
 +                        if proc.poll() is not None:
 +                            break
 +                        try:
@@ -695,22 +1822,29 @@ index a547895b2..25cc95200 100644
 +                        break
 +                    sess.last_mode = _mode
 +                    logger.info("Antigravity ACP keep-alive: session mode switched to %s", _mode)
-+            except Exception:
++            except Exception as exc:
++                if "interrupt" in str(exc).lower():
++                    raise
 +                pass
 +
 +        text_parts: list[str] = []
 +        reasoning_parts: list[str] = []
++        # Per-prompt token delta: usageUpdate reports cumulative session
++        # totals, so snapshot before the prompt and diff after.
++        _prev_usage = dict(sess.progress.get("usage") or {})
 +        # Send session/prompt
 +        rid = sess.next_id
 +        sess.next_id += 1
 +        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "session/prompt", "params": {"sessionId": sess.session_id, "prompt": [{"type": "text", "text": prompt_text}]}}) + "\n")
 +        proc.stdin.flush()
-+        deadline = time.monotonic() + timeout_seconds
++        prompt_start = time.monotonic()
++        deadline = prompt_start + timeout_seconds
 +        while time.monotonic() < deadline:
++            if sess.cancel_event.is_set():
++                raise RuntimeError("ACP prompt interrupted.")
 +            if proc.poll() is not None:
 +                # Kernel died mid-prompt — evict so next turn boots fresh
-+                with _KEEP_ALIVE_REGISTRY_LOCK:
-+                    _KEEP_ALIVE_REGISTRY.pop(sess.key, None)
++                evict_acp_keep_alive_session(sess.key, reason="kernel-exited-mid-prompt")
 +                stderr_text = "\n".join(stderr_tail).strip()
 +                raise RuntimeError(f"Copilot ACP process exited early: {stderr_text}" if stderr_text else "Copilot ACP process exited early")
 +            try:
@@ -725,56 +1859,276 @@ index a547895b2..25cc95200 100644
 +                err = msg.get("error") or {}
 +                raise RuntimeError(f"Copilot ACP session/prompt failed: {err.get('message') or err}")
 +            # Success — result is empty, text arrived via session/update
++            _finalize_progress_usage(sess.progress, _prev_usage)
++            _log_kernel_usage(sess.progress, sess.session_id)
 +            return "".join(text_parts), "".join(reasoning_parts)
-+        # Timeout — keep session (kernel still alive, just slow) but surface error
-+        raise TimeoutError(f"Timed out waiting for Copilot ACP response to session/prompt.")
++        # Timeout — keep session (kernel still alive, just slow) but surface
++        # elapsed time + stderr + last activity so the next stall is
++        # diagnosable from the log (and the wait loop showed live progress).
++        elapsed = time.monotonic() - prompt_start
++        stderr_text = "\n".join(stderr_tail).strip()
++        tail = "\n".join(stderr_text.splitlines()[-10:]) if stderr_text else "no stderr"
++        _activity = _progress_activity_summary(sess.progress)
++        logger.warning(
++            "Copilot ACP session/prompt timed out after %.0fs (cwd=%s, session %s). %s stderr: %s",
++            elapsed, sess.cwd, sess.session_id, _activity, tail,
++        )
++        raise TimeoutError(
++            f"Timed out waiting for Copilot ACP response to session/prompt after {elapsed:.0f}s. {_activity} stderr: {tail}"
++        )
 +
      def _handle_server_message(
          self,
          msg: dict[str, Any],
 diff --git a/apps/desktop/src/app/settings/constants.ts b/apps/desktop/src/app/settings/constants.ts
-index daa1d05cc..2430f2233 100644
+index daa1d05cc3..986a1cf5ae 100644
 --- a/apps/desktop/src/app/settings/constants.ts
 +++ b/apps/desktop/src/app/settings/constants.ts
-@@ -231,6 +231,7 @@ export const PROVIDER_GROUPS: ProviderPrefix[] = [
+@@ -231,6 +231,8 @@ export const PROVIDER_GROUPS: ProviderPrefix[] = [
  // Schema-side select overrides for desktop-relevant enum fields whose
  // backend schema only declares a string type.
  export const ENUM_OPTIONS: Record<string, string[]> = {
 +  'model.acp_mode': ['default', 'auto_edit', 'yolo'],
++  'model.acp_context_pack': ['off', 'auto'],
    'agent.image_input_mode': ['auto', 'native', 'text'],
    'approvals.mode': ['manual', 'smart', 'off'],
    'code_execution.mode': ['project', 'strict'],
-@@ -375,6 +376,9 @@ export const FREE_INPUT_KEYS = new Set([
+@@ -375,6 +377,11 @@ export const FREE_INPUT_KEYS = new Set([
  
  export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
    model: 'Default Model',
 +  'model.acpMode': 'Antigravity Mode',
 +  'model.acpKeepAlive': 'Keep ACP Kernel Alive',
 +  'model.acpLeanPrompt': 'Lean ACP Prompt',
++  'model.acpContextPack': 'ACP Context Pack (Memory + Skills)',
++  'model.acpProgressFeed': 'ACP Kernel Progress Feed',
    modelContextLength: 'Context Window',
    fallbackProviders: 'Fallback Models',
    toolsets: 'Enabled Toolsets',
-@@ -544,6 +548,9 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
+@@ -544,6 +551,11 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
  
  export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
    model: 'Used for new chats unless you pick a different model in the composer.',
 +  'model.acpMode': 'Antigravity kernel mode — default (asks before edits), auto_edit (auto edits), yolo (auto everything). Applies only to antigravity-acp.',
 +  'model.acpKeepAlive': 'When on, the Antigravity kernel stays alive across turns (one boot per Hermes session, like Zed). Off = fresh kernel each request.',
 +  'model.acpLeanPrompt': 'When on, omit the Hermes tool-schema block from the prompt sent to the kernel. The kernel has its own tools — the schema is just noise.',
++  'model.acpContextPack': 'When on, attach Hermes memory (MEMORY.md/USER.md) + the top relevant domain skills to the kernel prompt — the context the kernel never sees in the transcript, like native providers get. auto = 5 most relevant skills. Only applies to antigravity-acp.',
++  'model.acpProgressFeed': 'When on, parse the kernel stderr telemetry (tool calls, steps, token usage) for live status in the chat while waiting (e.g. "kernel: codegraph_explore…"), real token counts, and stall diagnostics with the last activity. Tolerant parser — a changed kernel log format falls back to the old behavior. Only applies to antigravity-acp.',
    modelContextLength: "Leave at 0 to use the selected model's detected context window.",
    fallbackProviders: 'Backup provider:model entries to try if the default model fails.',
    display: {
-@@ -633,7 +640,7 @@ export const SECTIONS: DesktopConfigSection[] = [
+@@ -633,7 +645,7 @@ export const SECTIONS: DesktopConfigSection[] = [
      id: 'model',
      label: 'Model',
      icon: Box,
 -    keys: ['model_context_length', 'fallback_providers']
-+    keys: ['model.acp_mode', 'model.acp_keep_alive', 'model.acp_lean_prompt', 'model_context_length', 'fallback_providers']
++    keys: ['model.acp_mode', 'model.acp_keep_alive', 'model.acp_lean_prompt', 'model.acp_context_pack', 'model.acp_progress_feed', 'model_context_length', 'fallback_providers']
    },
    {
      id: 'chat',
+diff --git a/apps/desktop/src/app/shell/model-catalog-menu.tsx b/apps/desktop/src/app/shell/model-catalog-menu.tsx
+index 351fa24c54..80d0bf6e76 100644
+--- a/apps/desktop/src/app/shell/model-catalog-menu.tsx
++++ b/apps/desktop/src/app/shell/model-catalog-menu.tsx
+@@ -19,7 +19,7 @@ import { HighlightMatches } from '@/components/ui/highlight-matches'
+ import { usePointerQuiet } from '@/components/ui/keyboard-first'
+ import { Skeleton } from '@/components/ui/skeleton'
+ import type { HermesGateway } from '@/hermes'
+-import { getLocalModelsStatus } from '@/hermes'
++import { getHermesConfigRecord, saveHermesConfig, getLocalModelsStatus } from '@/hermes'
+ import { useI18n } from '@/i18n'
+ import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
+ import { displayModelName, modelDisplayParts } from '@/lib/model-status-label'
+@@ -139,6 +139,41 @@ export function ModelCatalogMenu({
+   const { t } = useI18n()
+   const copy = t.shell.modelMenu
+   const copyPicker = t.modelPicker
++  const [acpMode, setAcpMode] = useState<string>("yolo")
++  const [acpModeSaving, setAcpModeSaving] = useState(false)
++
++  useEffect(() => {
++    let cancelled = false
++    getHermesConfigRecord(profile ?? undefined)
++      .then((cfg: any) => {
++        if (cancelled) return
++        const m = cfg?.model
++        let v = ""
++        if (typeof m === "object" && m !== null) v = String(m.acp_mode ?? "").trim().toLowerCase()
++        else if (typeof cfg?.["model.acp_mode"] === "string") v = String(cfg["model.acp_mode"]).trim().toLowerCase()
++        if (["default", "auto_edit", "yolo"].includes(v)) setAcpMode(v)
++      })
++      .catch(() => {})
++    return () => { cancelled = true }
++  }, [profile])
++
++  const handleAcpModeChange = async (nextMode: string) => {
++    if (nextMode === acpMode || acpModeSaving) return
++    setAcpModeSaving(true)
++    try {
++      if (request) {
++        try {
++          await request("config.set", { key: "model.acp_mode", value: nextMode, ...(sessionId ? { session_id: sessionId } : {}) })
++        } catch {}
++      }
++      const cfg: any = await getHermesConfigRecord(profile ?? undefined)
++      const next = { ...cfg, model: { ...(cfg?.model || {}), acp_mode: nextMode } }
++      await saveHermesConfig(next, profile ?? undefined)
++      setAcpMode(nextMode)
++    } catch {} finally {
++      setAcpModeSaving(false)
++    }
++  }
+   const closeMenu = useContext(ModelMenuCloseContext)
+   const [search, setSearch] = useState('')
+   const collapsedProviders = useStoreCollapsed()
+@@ -651,6 +686,51 @@ export function ModelCatalogMenu({
+           host footer's group rather than opening a second one, so a host that
+           contributes rows (the composer's Refresh Models) keeps the single
+           trailing block it has always rendered. */}
++      {/* Antigravity ACP mode switcher */}
++      {(() => {
++        const isAntigravity = current.provider === "antigravity-acp" || groups.some(g => g.provider.slug === "antigravity-acp") || groups.some(g => isCurrentProvider(g.provider, "antigravity-acp"))
++        if (!isAntigravity) return null
++        return (
++          <>
++            <DropdownMenuSeparator className="mx-0" />
++            <div
++              className="flex items-center justify-between gap-2 px-2.5 py-1.5 text-xs select-none bg-muted/25"
++              onPointerDown={e => e.stopPropagation()}
++            >
++              <div className="flex flex-col">
++                <span className="text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-tertiary)">
++                  Antigravity Mode
++                </span>
++                <span className="text-[0.5625rem] text-(--ui-text-tertiary)">
++                  {acpMode === "default" ? "ask before edits" : acpMode === "auto_edit" ? "auto edits" : "auto everything"}
++                </span>
++              </div>
++              <div className="flex items-center gap-1">
++                {(["default", "auto_edit", "yolo"] as const).map(m => (
++                  <button
++                    key={m}
++                    type="button"
++                    disabled={acpModeSaving}
++                    onClick={async e => {
++                      e.preventDefault()
++                      e.stopPropagation()
++                      await handleAcpModeChange(m)
++                    }}
++                    className={cn(
++                      "cursor-pointer rounded px-1.5 py-0.5 font-mono text-[0.625rem] transition-colors",
++                      acpMode === m
++                        ? "bg-primary font-bold text-primary-foreground shadow-xs"
++                        : "bg-(--ui-bg-tertiary) text-(--ui-text-tertiary) hover:text-foreground hover:bg-(--ui-control-hover-background)"
++                    )}
++                  >
++                    {m === "auto_edit" ? "auto edit" : m}
++                  </button>
++                ))}
++              </div>
++            </div>
++          </>
++        )
++      })()}
+       <DropdownMenuSeparator className="mx-0" />
+       {footer}
+       <DropdownMenuItem
+diff --git a/apps/desktop/src/app/shell/model-edit-submenu.tsx b/apps/desktop/src/app/shell/model-edit-submenu.tsx
+index 68b7281345..aee64e4023 100644
+--- a/apps/desktop/src/app/shell/model-edit-submenu.tsx
++++ b/apps/desktop/src/app/shell/model-edit-submenu.tsx
+@@ -9,6 +9,8 @@ import {
+   DropdownMenuSubContent
+ } from '@/components/ui/dropdown-menu'
+ import { Switch } from '@/components/ui/switch'
++import { useEffect, useState } from 'react'
++import { getHermesConfigRecord, saveHermesConfig } from '@/hermes'
+ import { useI18n } from '@/i18n'
+ import { isThinkingEnabled, REASONING_EFFORTS, resolveReasoningEffort } from '@/lib/reasoning-effort'
+ 
+@@ -109,10 +111,43 @@ function ModelEditSubmenuBody({
+   isActive,
+   onSelectModel,
+   onSetOptions,
++  provider,
+   reasoning
+ }: ModelEditSubmenuProps) {
+   const { t } = useI18n()
+   const copy = t.shell.modelOptions
++  const isAntigravity = provider === "antigravity-acp"
++  const [acpMode, setAcpMode] = useState<string>("yolo")
++  const [acpModeSaving, setAcpModeSaving] = useState(false)
++
++  useEffect(() => {
++    if (!isAntigravity) return
++    let cancelled = false
++    getHermesConfigRecord()
++      .then((cfg: any) => {
++        if (cancelled) return
++        const m = cfg?.model
++        let v = ""
++        if (typeof m === "object" && m !== null) v = String(m.acp_mode ?? "").trim().toLowerCase()
++        else if (typeof cfg?.["model.acp_mode"] === "string") v = String(cfg["model.acp_mode"]).trim().toLowerCase()
++        if (["default", "auto_edit", "yolo"].includes(v)) setAcpMode(v)
++      })
++      .catch(() => {})
++    return () => { cancelled = true }
++  }, [isAntigravity])
++
++  const handleAcpModeChange = async (nextMode: string) => {
++    if (nextMode === acpMode || acpModeSaving) return
++    setAcpModeSaving(true)
++    try {
++      const cfg: any = await getHermesConfigRecord()
++      const next = { ...cfg, model: { ...(cfg?.model || {}), acp_mode: nextMode } }
++      await saveHermesConfig(next)
++      setAcpMode(nextMode)
++    } catch {} finally {
++      setAcpModeSaving(false)
++    }
++  }
+ 
+   const effortValue = resolveReasoningEffort(effort, defaultEffort)
+   const thinkingOn = isThinkingEnabled(effort, defaultEffort)
+@@ -140,7 +175,7 @@ function ModelEditSubmenuBody({
+   const hasFast = fastControl.kind !== 'none'
+   const fastOn = fastControl.kind === 'none' ? false : fastControl.on
+ 
+-  return !hasFast && !reasoning ? (
++  return !hasFast && !reasoning && !isAntigravity ? (
+     <div className="px-2.5 py-3 text-xs text-(--ui-text-tertiary)">{copy.noOptions}</div>
+   ) : (
+     <>
+@@ -180,6 +215,27 @@ function ModelEditSubmenuBody({
+           </DropdownMenuRadioGroup>
+         </>
+       ) : null}
++      {isAntigravity ? (
++        <>
++          <DropdownMenuSeparator className="mx-0" />
++          <DropdownMenuLabel className={dropdownMenuSectionLabel}>Antigravity Mode</DropdownMenuLabel>
++          <div className="px-2.5 pb-1 text-[0.625rem] text-(--ui-text-tertiary)">
++            default: ask · auto_edit: edits · yolo: all
++          </div>
++          <DropdownMenuRadioGroup value={acpMode} onValueChange={handleAcpModeChange}>
++            {(["default", "auto_edit", "yolo"] as const).map(m => (
++              <DropdownMenuRadioItem
++                className={dropdownMenuRow}
++                key={m}
++                onSelect={event => event.preventDefault()}
++                value={m}
++              >
++                {m === "auto_edit" ? "auto edit" : m}
++              </DropdownMenuRadioItem>
++            ))}
++          </DropdownMenuRadioGroup>
++        </>
++      ) : null}
+     </>
+   )
+ }
 diff --git a/apps/desktop/src/components/model-picker.tsx b/apps/desktop/src/components/model-picker.tsx
-index 11c34daa9..5dc8ea65d 100644
+index 11c34daa9e..5dc8ea65db 100644
 --- a/apps/desktop/src/components/model-picker.tsx
 +++ b/apps/desktop/src/components/model-picker.tsx
 @@ -1,7 +1,7 @@
@@ -865,8 +2219,40 @@ index 11c34daa9..5dc8ea65d 100644
          <DialogFooter className="flex-row items-center justify-end gap-2 bg-card p-3">
            <Button onClick={addProvider} variant="ghost">
              {copy.addProvider}
+diff --git a/apps/desktop/src/store/provider-wait.test.ts b/apps/desktop/src/store/provider-wait.test.ts
+index f5422fe4a8..1ea47085f7 100644
+--- a/apps/desktop/src/store/provider-wait.test.ts
++++ b/apps/desktop/src/store/provider-wait.test.ts
+@@ -17,6 +17,11 @@ describe('providerWaitText', () => {
+     expect(providerWaitText('⏳ waiting on local-model — 30s with no output yet')).not.toBe('')
+     expect(providerWaitText('◉_◉ cogitating...')).toBe('')
+   })
++
++  it('accepts ACP progress-feed kernel frames (agent/copilot_acp_client)', () => {
++    expect(providerWaitText('⏳ kernel: codegraph_explore (uniplus-api)…')).toBe('⏳ kernel: codegraph_explore (uniplus-api)…')
++    expect(providerWaitText('⏳ kernel sem atividade há 45s — última: view_file (x). O Google pode estar lento; continue aguardando ou envie stop para cancelar.')).not.toBe('')
++  })
+ })
+ 
+ describe('parseModelLoadWait', () => {
+diff --git a/apps/desktop/src/store/provider-wait.ts b/apps/desktop/src/store/provider-wait.ts
+index 7ecaffb59f..97e2fde179 100644
+--- a/apps/desktop/src/store/provider-wait.ts
++++ b/apps/desktop/src/store/provider-wait.ts
+@@ -45,7 +45,10 @@ export function clearAllProviderWaits(): void {
+ export function providerWaitText(text: string): string {
+   const value = text.trim()
+ 
+-  return /^(?:⏳|⚠|↻|⚙)\s*(?:waiting on|loading|processing prompt|no (?:output|response)|model returned)/i.test(value)
++  // Backend minted frames only. The trailing |kernel accepts the ACP progress
++  // feed frames ("⏳ kernel: codegraph_explore (uniplus-api)…" and
++  // "⏳ kernel sem atividade há 45s — última: …") — agent/copilot_acp_client.
++  return /^(?:⏳|⚠|↻|⚙)\s*(?:waiting on|loading|processing prompt|no (?:output|response)|model returned|kernel)/i.test(value)
+     ? value
+     : ''
+ }
 diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
-index 6f823fa63..83c386ac6 100644
+index 6f823fa63b..83c386ac6f 100644
 --- a/hermes_cli/auth.py
 +++ b/hermes_cli/auth.py
 @@ -134,6 +134,7 @@ MINIMAX_OAUTH_REFRESH_SKEW_SECONDS = 60
@@ -1030,7 +2416,7 @@ index 6f823fa63..83c386ac6 100644
          "command": resolved_command or command,
          "args": args,
 diff --git a/hermes_cli/inventory.py b/hermes_cli/inventory.py
-index 320bbc031..99454b827 100644
+index 320bbc0310..99454b8278 100644
 --- a/hermes_cli/inventory.py
 +++ b/hermes_cli/inventory.py
 @@ -798,6 +798,25 @@ def _filter_explicit_provider_rows(rows: list[dict], ctx: ConfigContext) -> list
@@ -1080,7 +2466,7 @@ index 320bbc031..99454b827 100644
      """Return True when the user's raw config explicitly enables MoA.
  
 diff --git a/hermes_cli/main.py b/hermes_cli/main.py
-index 8a43b2374..a35a45464 100644
+index 8a43b23745..a35a454645 100644
 --- a/hermes_cli/main.py
 +++ b/hermes_cli/main.py
 @@ -890,6 +890,7 @@ from hermes_cli.model_setup_flows import (
@@ -1101,10 +2487,10 @@ index 8a43b2374..a35a45464 100644
          _model_flow_copilot(config, current_model)
      elif selected_provider == "custom":
 diff --git a/hermes_cli/model_setup_flows.py b/hermes_cli/model_setup_flows.py
-index adda8b6a6..034529255 100644
+index adda8b6a6a..f539521d7b 100644
 --- a/hermes_cli/model_setup_flows.py
 +++ b/hermes_cli/model_setup_flows.py
-@@ -2145,12 +2145,121 @@ def _model_flow_copilot_acp(config, current_model=""):
+@@ -2145,12 +2145,151 @@ def _model_flow_copilot_acp(config, current_model=""):
  
      print(f"Default model set to: {selected} (via {pconfig.name})")
  
@@ -1201,6 +2587,34 @@ index adda8b6a6..034529255 100644
 +    except Exception:
 +        chosen_mode = None
 +
++    # Prompt for the ACP context pack (attach memory + domain skills to the
++    # kernel prompt). auto = memory + top-5 relevant skills; off = transcript
++    # only. Stored as model.acp_context_pack; the ACP client reads it.
++    try:
++        current_pack = ""
++        try:
++            _cfg_tmp = load_config()
++            _m = _cfg_tmp.get("model") or {}
++            if isinstance(_m, dict):
++                current_pack = str(_m.get("acp_context_pack") or "").strip().lower()
++        except Exception:
++            pass
++        if current_pack not in {"auto", "off"}:
++            current_pack = "auto" if not current_pack else current_pack
++        print()
++        print(f"  Current Antigravity context pack: {current_pack or 'off'}")
++        print("  auto: attach the user's memory + top relevant Hermes skills to the kernel prompt (like native providers).")
++        print("  off: kernel sees only the conversation transcript.")
++        try:
++            raw_pack = input(f"  Antigravity context pack [{current_pack}] (auto/off, Enter to keep): ").strip().lower()
++        except (KeyboardInterrupt, EOFError):
++            raw_pack = ""
++        chosen_pack = raw_pack if raw_pack in {"auto", "off"} else current_pack
++        if chosen_pack not in {"auto", "off"}:
++            chosen_pack = "off"
++    except Exception:
++        chosen_pack = None
++
 +    cfg = load_config()
 +    model = cfg.get("model")
 +    if not isinstance(model, dict):
@@ -1211,6 +2625,8 @@ index adda8b6a6..034529255 100644
 +    model["api_mode"] = "chat_completions"
 +    if chosen_mode in {"default", "auto_edit", "yolo"}:
 +        model["acp_mode"] = chosen_mode
++    if chosen_pack in {"auto", "off"}:
++        model["acp_context_pack"] = chosen_pack
 +    clear_model_endpoint_credentials(model, clear_api_mode=False)
 +    save_config(cfg)
 +    deactivate_provider()
@@ -1230,7 +2646,7 @@ index adda8b6a6..034529255 100644
      """
      from hermes_cli.main import _prompt_api_key
 diff --git a/hermes_cli/model_switch.py b/hermes_cli/model_switch.py
-index 5f9c11d08..282ee2da1 100644
+index 5f9c11d085..282ee2da1b 100644
 --- a/hermes_cli/model_switch.py
 +++ b/hermes_cli/model_switch.py
 @@ -3346,6 +3346,16 @@ def list_authenticated_providers(
@@ -1282,7 +2698,7 @@ index 5f9c11d08..282ee2da1 100644
              continue
  
 diff --git a/hermes_cli/models.py b/hermes_cli/models.py
-index 86aa7f1e4..c0a8b627a 100644
+index 86aa7f1e41..c0a8b627ac 100644
 --- a/hermes_cli/models.py
 +++ b/hermes_cli/models.py
 @@ -351,6 +351,20 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
@@ -1326,7 +2742,7 @@ index 86aa7f1e4..c0a8b627a 100644
      "google-gemini": "gemini",
      "google-ai-studio": "gemini",
 diff --git a/hermes_cli/providers.py b/hermes_cli/providers.py
-index f3ecd99d2..e472453ac 100644
+index f3ecd99d22..e472453ac2 100644
 --- a/hermes_cli/providers.py
 +++ b/hermes_cli/providers.py
 @@ -95,6 +95,12 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
@@ -1343,7 +2759,7 @@ index f3ecd99d2..e472453ac 100644
          transport="openai_chat",
          extra_env_vars=("COPILOT_GITHUB_TOKEN", "GH_TOKEN"),
 diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
-index 605d2d713..1164834a9 100644
+index 605d2d7135..1164834a9f 100644
 --- a/hermes_cli/runtime_provider.py
 +++ b/hermes_cli/runtime_provider.py
 @@ -2337,10 +2337,15 @@ def resolve_runtime_provider(
@@ -1365,7 +2781,7 @@ index 605d2d713..1164834a9 100644
              "base_url": creds.get("base_url", "").rstrip("/"),
              "api_key": creds.get("api_key", ""),
 diff --git a/hermes_cli/setup.py b/hermes_cli/setup.py
-index 1213eb115..53d2b1feb 100644
+index 1213eb1158..53d2b1febf 100644
 --- a/hermes_cli/setup.py
 +++ b/hermes_cli/setup.py
 @@ -77,6 +77,20 @@ _DEFAULT_PROVIDER_MODELS = {
@@ -1390,10 +2806,10 @@ index 1213eb115..53d2b1feb 100644
          "gpt-5.4",
          "gpt-5.4-mini",
 diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
-index a2bce1d85..702a7d83a 100644
+index a2bce1d852..193ef02111 100644
 --- a/hermes_cli/web_server.py
 +++ b/hermes_cli/web_server.py
-@@ -1321,6 +1321,22 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
+@@ -1321,6 +1321,33 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
          "description": "Context window override (0 = auto-detect from model metadata)",
          "category": "general",
      },
@@ -1413,10 +2829,21 @@ index a2bce1d85..702a7d83a 100644
 +        "description": "Send a lean prompt to the Antigravity kernel — omit the Hermes tool-schema block. The kernel uses its own tools, so the schema is noise. On = cleaner prompt, lower tokens. Only applies to antigravity-acp.",
 +        "category": "general",
 +    },
++    "model.acp_context_pack": {
++        "type": "select",
++        "options": ["off", "auto"],
++        "description": "Attach Hermes memory (MEMORY.md/USER.md) + top-N domain skills to the Antigravity kernel prompt — the context the kernel never sees in the transcript (no structured system prompt or skill_view like native providers). auto = 5 most relevant skills. Off = transcript only. Only applies to antigravity-acp.",
++        "category": "general",
++    },
++    "model.acp_progress_feed": {
++        "type": "boolean",
++        "description": "Parse the Antigravity kernel stderr telemetry (tool calls, steps, token usage) for live wait-notice status ('kernel: codegraph_explore…' instead of 'no response yet'), real token accounting (in/out), and stall diagnostics with last activity. Parser is tolerant — a changed kernel log format degrades to the old behavior. Only applies to antigravity-acp.",
++        "category": "general",
++    },
      "terminal.backend": {
          "type": "select",
          "description": "Terminal execution backend",
-@@ -1595,14 +1611,22 @@ def _build_schema_from_config(
+@@ -1595,14 +1622,24 @@ def _build_schema_from_config(
  CONFIG_SCHEMA = _build_schema_from_config(DEFAULT_CONFIG)
  
  # Inject virtual fields that don't live in DEFAULT_CONFIG but are surfaced
@@ -1430,6 +2857,7 @@ index a2bce1d85..702a7d83a 100644
 +_acp_mode_entry = _SCHEMA_OVERRIDES["model.acp_mode"]
 +_acp_keep_alive_entry = _SCHEMA_OVERRIDES["model.acp_keep_alive"]
 +_acp_lean_entry = _SCHEMA_OVERRIDES["model.acp_lean_prompt"]
++_acp_progress_entry = _SCHEMA_OVERRIDES["model.acp_progress_feed"]
  _ordered_schema: Dict[str, Dict[str, Any]] = {}
  for _k, _v in CONFIG_SCHEMA.items():
      _ordered_schema[_k] = _v
@@ -1438,10 +2866,11 @@ index a2bce1d85..702a7d83a 100644
 +        _ordered_schema["model.acp_mode"] = _acp_mode_entry
 +        _ordered_schema["model.acp_keep_alive"] = _acp_keep_alive_entry
 +        _ordered_schema["model.acp_lean_prompt"] = _acp_lean_entry
++        _ordered_schema["model.acp_progress_feed"] = _acp_progress_entry
  CONFIG_SCHEMA = _ordered_schema
  
  
-@@ -11121,9 +11145,26 @@ def _copilot_acp_status() -> Dict[str, Any]:
+@@ -11121,9 +11158,26 @@ def _copilot_acp_status() -> Dict[str, Any]:
          "logged_in": False,
          "source": "copilot_cli",
          "source_label": "Managed by the GitHub Copilot CLI",
@@ -1471,7 +2900,7 @@ index a2bce1d85..702a7d83a 100644
      }
  
  
-@@ -11196,6 +11237,14 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
+@@ -11196,6 +11250,14 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
          "docs_url": "https://docs.github.com/en/copilot",
          "status_fn": _copilot_acp_status,
      },
@@ -1487,7 +2916,7 @@ index a2bce1d85..702a7d83a 100644
      #
      # This card is deliberately flow == "external" (no in-dashboard "Connect"
 diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
-index abbad7cbf..406326a93 100644
+index abbad7cbfb..406326a932 100644
 --- a/tools/delegate_tool.py
 +++ b/tools/delegate_tool.py
 @@ -1948,9 +1948,12 @@ def _build_child_agent(
@@ -1507,7 +2936,7 @@ index abbad7cbf..406326a93 100644
  
      # Resolve reasoning config: delegation override > parent inherit
 diff --git a/web/src/components/ModelPickerDialog.tsx b/web/src/components/ModelPickerDialog.tsx
-index 20256cbd6..609c66b19 100644
+index 20256cbd6a..609c66b190 100644
 --- a/web/src/components/ModelPickerDialog.tsx
 +++ b/web/src/components/ModelPickerDialog.tsx
 @@ -5,6 +5,7 @@ import { Spinner } from "@nous-research/ui/ui/components/spinner";
@@ -1609,6 +3038,3 @@ index 20256cbd6..609c66b19 100644
          <footer className="border-t border-border p-3 flex items-center justify-between gap-3 flex-wrap">
            {alwaysGlobal ? (
              <span className="text-xs text-muted-foreground">
--- 
-2.50.1 (Apple Git-155)
-
